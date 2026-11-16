@@ -1,4 +1,5 @@
 # Predictive Cooling Optimization for Data Centers
+![CoverPage](https://github.com/NuBFightForMyDream/2110582_AIApps_Project_PredictiveCoolingForDataCenter/blob/main/CoverPage.png)
 
 > **"If the load will rise in 30 minutes, how should we adjust the cooling right now so the racks stay below the limit and we use as little electricity as possible?"**
 
