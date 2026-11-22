@@ -14,6 +14,19 @@ supply/return air, setpoint, CRAH fan speed, chiller / CRAH fan / pumps + tower 
 - **Operator**: a deadband rule plus occasional setpoint step tests, so the history covers many setpoints.
 - **Log faults on purpose**: 0.3 % missing cells, 85 / −40 / 0 °C glitches, inlet A3 stuck for 8 h, two logger outages (18 rows).
 
+![floor map](../docs/floor-map.png)
+
+| Column | Unit | Meaning |
+|---|---|---|
+| `outdoor_temp_c` | °C | Outdoor air temperature (hot, humid Bangkok-like climate, warming toward April, afternoon storms) |
+| `it_load_pct`, `it_power_kw` | %, kW | Average CPU/GPU load and server power (including the fans inside the servers) |
+| `inlet_A1_c` … `inlet_B6_c` | °C | Air temperature at the front of each rack: **must stay at or below 27 °C** (ASHRAE) |
+| `supply_air_c`, `return_air_c` | °C | Cold air leaving the CRAH units / hot air coming back |
+| `crah_setpoint_c` | °C | **The one knob the AI controls**: supply-air setpoint (16–24 °C) |
+| `crah_fan_pct` | % | CRAH fan speed (automatic, follows load) |
+| `chiller_kw`, `crah_fan_kw`, `pump_tower_kw`, `cooling_kw` | kW | Cooling sub-meters |
+| `facility_kw`, `pue` | kW, – | Whole-building power and PUE = facility ÷ IT |
+
 ## Equipment historian — `data/equipment_telemetry.csv`
 
 What the 22 field devices report: 8,736 rows × 69 points (`hardware/telemetry.py`), from the same plant run (same seeds),

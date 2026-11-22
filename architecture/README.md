@@ -13,7 +13,7 @@ how to run it; read these for how each part works and why.
 | [hardware.md](hardware.md) | 22 devices, sensor gateway, diagnostics, cooling constraint, installed models | `hardware/` |
 | [security.md](security.md) | Threat model, integrity model, replay, command audit, prompt screen, signing, audit chain | `security/` |
 | [upgrades.md](upgrades.md) | Flows, upgrade options, the physical + AI study, the advisor | `hardware/flows.py`, `hardware/upgrades.py`, `hardware/advisor.py` |
-| [dashboard.md](dashboard.md) | The 12 pages, the shared moment, page structure, performance | `app.py`, `app_pages/`, `ui/` |
+| [dashboard.md](dashboard.md) | The 7 pages, the shared moment, page structure, performance | `app.py`, `app_pages/`, `ui/` |
 | [deployment.md](deployment.md) | Local run, Streamlit Cloud, secrets, Supabase, tests, regeneration | `.streamlit/`, `supabase/`, `tests/` |
 | [review.md](review.md) | Known limits, what was not tested, next steps | — |
 

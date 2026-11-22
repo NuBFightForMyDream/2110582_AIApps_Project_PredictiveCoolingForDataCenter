@@ -41,20 +41,18 @@ def diagram(body, alt):
     st.mermaid_chart(body + "\n" + MERMAID_STYLE if body.startswith("flowchart") else body, alt=alt)
 
 
-def page_header(title, icon, lead, points=(), art=None):
-    """Title, one-sentence lead and the plain-language points on the left; the page's illustration on the right."""
-    left, right = st.columns([3, 1.05], vertical_alignment="center", gap="large")
+def page_header(title, icon, lead, art=None):
+    """Title and one plain sentence on the left, the page's small illustration on the right."""
+    left, right = st.columns([4.2, 1], vertical_alignment="center", gap="large")
     with left:
         st.title(title, icon=icon)
         st.markdown(lead)
-        if points:
-            st.markdown("\n".join(f"- {p}" for p in points))
     if art:
         right.image(ART[art], width="stretch", alt=f"Illustration: {title}")
 
 
 def how_it_works(label="How it works", expanded=False, icon=":material/account_tree:"):
-    """The collapsible place for diagrams and method notes, so the page itself stays short."""
+    """The collapsible place for diagrams, method notes and secondary charts, so each page stays short."""
     return st.expander(label, expanded=expanded, icon=icon)
 
 

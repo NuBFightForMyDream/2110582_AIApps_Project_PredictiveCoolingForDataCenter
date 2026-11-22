@@ -50,3 +50,14 @@ sequenceDiagram
 Budgets (`Policy`): 30 tool calls, 24 model calls, 120 s offline / 300 s live, 5 live cases per 10 min per session and 40 per
 hour per app. Live modes are tested with scripted providers and a mock Claude server; the last live Gemini run predates the
 Security Analyst and Hardware Engineer.
+
+## Example cases
+
+Example case (`python -m predictive_cooling.agents --at "2026-04-21 00:30"`): the Data Analyst finds that holding 22 °C would
+reach 27.5 °C (incl. margin) when the 01:00 GPU batch starts. The Cooling Advisor finds 18 of 81 plans safe and proposes
+21 °C (plan 21 → 21 → 21 → 22). The Security Analyst finds the readings consistent with physics, and the Hardware Engineer finds all
+22 devices healthy. G3 re-reads and recomputes, all 9 checks pass, G4 signs the answer, and it is "Change from 22 °C to 21 °C now". With `--fault B5 B6`, the data is not ready, the AI is withheld, and
+safety rule R1 moves toward the 20 °C fallback. At `--at "2026-04-29 05:30"` the MPC wants to warm the room after the GPU batch
+(21 °C), but the Hardware Engineer reports lost N+1 capacity (clogging CRAH-2 filter) and a worn pump bearing, so rule R5 keeps
+20 °C. With `--attack spoofing` at 21 Apr 02:00 the Security Analyst sees B4–B6 reading ~2.9 °C cooler than their PDU power allows:
+status `security_alert`, the AI is withheld and R6 keeps the room no warmer than now.

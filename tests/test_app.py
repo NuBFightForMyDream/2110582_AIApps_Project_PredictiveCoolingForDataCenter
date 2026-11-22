@@ -11,9 +11,9 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
-PAGES = {"home": "Predictive cooling for a data center", "agents": "Ask the agents", "live_plant": "Live plant",
-         "hardware": "Equipment health", "upgrades": "Upgrade advisor", "security": "Security", "sensors": "Sensors",
-         "cleaning": "Clean data", "forecast": "Forecast", "mpc": "Plan (MPC)", "safety": "Safety", "results": "Results"}
+PAGES = {"home": "Predictive cooling for a data center", "agents": "Ask the agents", "results": "Results",
+         "data_center": "Data center", "security": "Security", "upgrades": "Upgrades", "how_it_works": "How it works"}
+STEPS = ["1 · Sensors", "2 · Clean", "3 · Forecast", "4 · Plan", "5 · Safety"]
 
 
 def render(page="home", **preset):
@@ -45,13 +45,24 @@ def test_agents_page_answers_the_default_case():
     ({"moment_day": dt.date(2026, 4, 21), "moment_time": "00:30"}, "none"),           # before the faults start
 ])
 def test_equipment_health_follows_the_sidebar_moment(preset, constraint):
-    _, metrics = render("hardware", **preset)
+    _, metrics = render("data_center", **preset)
     assert metrics["Cooling constraint"] == constraint
 
 
-def test_live_plant_handles_a_device_that_does_not_answer():
-    _, metrics = render("live_plant", moment_day=dt.date(2026, 4, 26), moment_time="15:00")
-    assert metrics["PUE"].startswith("1.")
+def test_data_center_handles_a_device_that_does_not_answer():
+    _, metrics = render("data_center", moment_day=dt.date(2026, 4, 26), moment_time="15:00")
+    assert metrics["PUE"].startswith("1.") and metrics["Equipment health"] == "Warning"
+
+
+@pytest.mark.parametrize("step", STEPS)
+def test_every_how_it_works_step_renders(step):
+    at, _ = render("how_it_works", how_step=step)
+    assert at.title[0].value == "How it works"
+
+
+@pytest.mark.parametrize("scenario", ["normal", "sensor_failure", "plant_change", "load_surge"])
+def test_results_shows_every_scenario(scenario):
+    render("results", res_sc=scenario)
 
 
 def test_every_metric_card_has_a_width_that_fits_its_text(monkeypatch):
@@ -68,6 +79,8 @@ def test_every_metric_card_has_a_width_that_fits_its_text(monkeypatch):
     monkeypatch.setattr(st, "metric", recording)
     for page in PAGES:
         render(page)
+    for step in STEPS:
+        render("how_it_works", how_step=step)
     assert widths
     pages = sorted((Path(APP).parent / "app_pages").glob("*.py"))
     assert not [f.name for f in pages if ".metric(" in f.read_text()], "pages must use ui.common.kpi_row, not .metric()"

@@ -35,26 +35,15 @@ from ui.art import LOGO  # noqa: E402
 from ui.common import moment_picker  # noqa: E402   (loads the study once per process)
 
 st.logo(LOGO, size="large")
-page = st.navigation({
-    "": [
-        st.Page("app_pages/home.py", title="Overview", icon=":material/home:", default=True),
-        st.Page("app_pages/agents.py", title="Ask the agents", icon=":material/smart_toy:"),
-    ],
-    "Operations": [
-        st.Page("app_pages/live_plant.py", title="Live plant", icon=":material/factory:"),
-        st.Page("app_pages/hardware.py", title="Equipment health", icon=":material/memory:"),
-        st.Page("app_pages/upgrades.py", title="Upgrade advisor", icon=":material/construction:"),
-        st.Page("app_pages/security.py", title="Security", icon=":material/security:"),
-    ],
-    "How the AI decides": [
-        st.Page("app_pages/sensors.py", title="1 · Sensors", icon=":material/sensors:"),
-        st.Page("app_pages/cleaning.py", title="2 · Clean data", icon=":material/cleaning_services:"),
-        st.Page("app_pages/forecast.py", title="3 · Forecast", icon=":material/insights:"),
-        st.Page("app_pages/mpc.py", title="4 · Plan (MPC)", icon=":material/route:"),
-        st.Page("app_pages/safety.py", title="5 · Safety", icon=":material/shield:"),
-        st.Page("app_pages/results.py", title="6 · Results", icon=":material/bolt:"),
-    ],
-}, position="top")
+page = st.navigation([
+    st.Page("app_pages/home.py", title="Overview", icon=":material/home:", default=True),
+    st.Page("app_pages/agents.py", title="Ask the agents", icon=":material/smart_toy:"),
+    st.Page("app_pages/results.py", title="Results", icon=":material/bolt:"),
+    st.Page("app_pages/data_center.py", title="Data center", icon=":material/factory:"),
+    st.Page("app_pages/security.py", title="Security", icon=":material/security:"),
+    st.Page("app_pages/upgrades.py", title="Upgrades", icon=":material/construction:"),
+    st.Page("app_pages/how_it_works.py", title="How it works", icon=":material/account_tree:"),
+], position="top")
 
 with st.sidebar:
     moment_picker()

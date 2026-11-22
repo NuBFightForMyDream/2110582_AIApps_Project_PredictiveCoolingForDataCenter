@@ -1,15 +1,16 @@
-"""Live plant: the whole site at one moment, with its flows and installed equipment."""
+"""The plant drawing, the energy / heat Sankeys and the equipment trend panels (Data center page)."""
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.colors import sample_colorscale
+from plotly.subplots import make_subplots
 
 from predictive_cooling import config as C
 from predictive_cooling.hardware.catalog import INSTALLED, INSTRUMENTS
-from predictive_cooling.hardware.flows import balance
-from predictive_cooling.hardware.registry import DEVICES, REGISTRY
-from ui.common import AXIS, CLEAN, EQUIP, FONT, INK, INK2, MUTED, SURFACE, kpi, kpi_row, moment, page_header, show, style
-
+from predictive_cooling.hardware.diagnostics import RULES as HW_RULES
+from predictive_cooling.hardware.diagnostics import metrics
+from predictive_cooling.hardware.registry import CRAH_RATED_AIRFLOW_M3H, CRAH_RATED_KW, REGISTRY
+from ui.common import AXIS, CRIT, CTRL, EQUIP, FONT, INK, INK2, MUTED, QTY, SURFACE, WARN, hw_limit, style
 
 FLOW = {"chw_supply": "#2a78d6", "chw_return": "#d03b3b", "condenser": "#eb6834", "power": "#6250d6",
         "cold": "#6da7ec", "hot": "#ec8a89"}
@@ -188,48 +189,69 @@ def heat_sankey(bal):
     return sankey(labels, colors, links, "Where the heat goes")
 
 
-page_header("Live plant", ":material/factory:", "The whole site at one moment: air, water and electricity, with the "
-            "installed model of every unit.",
-            ["**Air**: CRAH → cold aisle → racks → hot aisle. **Chilled water**: chiller → CRAH coils → pumps. **Condenser "
-             "water**: chiller → cooling tower. **Electricity**: grid → UPS → rack PDUs.",
-             "Hover any unit for its installed model, protocol and live points.",
-             "Two Sankey diagrams answer *where does the electricity go?* and *where does the heat go?*"], art="plant")
-dc_at = moment()
-room, eq_row = CLEAN.loc[dc_at] if dc_at in CLEAN.index else None, EQUIP.loc[dc_at] if dc_at in EQUIP.index else None
-if room is None or eq_row is None or room[C.INLET_COLS + ["facility_kw"]].isna().any():
-    st.warning("No complete reading at this moment (logger gap). Pick another time.")
-else:
-    bal = balance(room, eq_row)
-    kpi_row(kpi("PUE", f"{bal['kpi']['pue']:.2f}", help="Facility power ÷ IT power"),
-            kpi("Cooling ÷ IT", f"{bal['kpi']['cooling_per_it']:.2f}",
-                help="Cooling power ÷ IT power: the part of PUE the AI and the upgrades attack"),
-            kpi("Chiller kW/TR", f"{bal['kpi']['kw_per_tr']:.2f}", f"COP {bal['kpi']['cop']:.2f}",
-                help="1 TR = 3.517 kW of cooling; lower is better"),
-            kpi("Chilled-water ΔT", f"{bal['kpi']['chw_delta_c']:.1f} °C",
-                help="Return − supply; a low ΔT means pumping more water than the load needs"),
-            kpi("Hottest inlet", f"{bal['kpi']['hottest_inlet_c']:.1f} °C", help="ASHRAE recommended ≤ 27 °C"))
-    show(plant_schematic(room, eq_row, bal))
-    st.caption(f"{dc_at:%a %d %b %H:%M}. Arrows show direction; rack colour = inlet temperature (blue cool → red hot); the red "
-               "arrow at the row end is hot air recirculating around B6, the hot spot that containment fixes.")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.plotly_chart(power_sankey(bal), width="stretch", config={"displayModeBar": False})
-    with c2:
-        st.plotly_chart(heat_sankey(bal), width="stretch", config={"displayModeBar": False})
-    st.caption("Electricity from the sub-meters (PowerLogic PM5560) and the rack PDUs; heat from the same balance: every kW "
-               "the servers and fans use ends up in the chilled water, and the tower rejects it plus the chiller's own work.")
+# ---- equipment health --------------------------------------------------------------------
+KEY_POINTS = {
+    "crah": [("supply_air_c", "Supply"), ("fan_speed_pct", "Fan"), ("filter_dp_pa", "Filter ΔP")],
+    "chiller": [("load_pct", "Load"), ("cop", "COP"), ("cond_approach_c", "Cond. approach")],
+    "pump": [("flow_m3h", "Flow"), ("vibration_mm_s", "Vibration"), ("bearing_temp_c", "Bearing")],
+    "cooling_tower": [("fan_speed_pct", "Fan"), ("wet_bulb_c", "Wet bulb"), ("approach_c", "Approach")],
+    "ups": [("load_pct", "Load"), ("output_kw", "Output"), ("battery_temp_c", "Battery")],
+    "env": [("temp_c", "Temp"), ("rh_pct", "RH"), ("aisle_dp_pa", "Over-pressure")],
+}
+HW_FROM = "2026-04-06"              # trend panels: two weeks of build-up, then the test weeks
 
-st.subheader("Installed equipment and the instruments that measure it", icon=":material/inventory_2:")
-bom = pd.DataFrame([{"Device": d.id, "Role": d.name, "Installed model": (p.vendor + " · " if p.vendor != "—" else "") + p.model,
-                     "Facts used": p.facts, "Protocol": d.protocol, "Note": p.note, "Source": p.source or None}
-                    for d in DEVICES if d.kind != "pdu" for p in [INSTALLED[d.id]]]
-                   + [{"Device": "PDU-A1 … B6", "Role": "12 rack PDUs", "Installed model": "Raritan (Legrand) · PX3",
-                       "Facts used": INSTALLED["PDU-A1"].facts, "Protocol": "SNMP v3", "Note": INSTALLED["PDU-A1"].note,
-                       "Source": INSTALLED["PDU-A1"].source}])
-link = {"Source": st.column_config.LinkColumn(display_text="datasheet / page")}
-st.dataframe(bom, hide_index=True, width="stretch", column_config=link)
-st.dataframe(pd.DataFrame([{"Measures": what, "Instrument": f"{p.vendor} · {p.model}", "Facts used": p.facts, "Note": p.note,
-                            "Source": p.source} for what, p in INSTRUMENTS]), hide_index=True, width="stretch", column_config=link)
-st.caption("Named products are real product families with the vendor-published facts this project relies on (checked Nov 2026); "
-           "'class' rows describe a legacy unit without naming a model. The plant model's numbers (capacity, COP, fan power) are "
-           "this project's own, not datasheet values. Setra lists the Model 264 as discontinued: the advisor would plan a replacement.")
+
+@st.cache_data(show_spinner=False)
+def hardware_trends():
+    """Hourly series of the metrics the diagnostics use, for the trend panels."""
+    pdu = EQUIP[[REGISTRY[f"PDU-{r}"].column("power_kw") for r in C.RACKS]].sum(axis=1, min_count=len(C.RACKS))
+    peak7 = pdu.rolling("7D").max()
+    frame = EQUIP.loc[HW_FROM:]
+    out = pd.DataFrame(index=frame.index)
+    for u in (1, 2):
+        crah = REGISTRY[f"CRAH-{u}"]
+        speed = frame[crah.column("fan_speed_pct")] / 100
+        out[f"filter_{u}"] = metrics(frame, crah)["filter_dp_100_pa"]
+        out[f"cap_{u}"] = CRAH_RATED_KW * (frame[crah.column("airflow_m3h")] / (CRAH_RATED_AIRFLOW_M3H * speed)).clip(0.5, 1.0)
+    out["vibration"] = frame["CHWP-1.vibration_mm_s"]
+    out["approach"] = frame["CH-1.cond_approach_c"]
+    for sensor in ("ENV-CA-1", "ENV-CA-2"):
+        out[sensor] = metrics(frame, REGISTRY[sensor])["rh_deviation_pct"]
+    out["peak7"] = peak7.loc[HW_FROM:]
+    out["dp"] = frame["ENV-DP-1.aisle_dp_pa"]
+    return out.resample("1h").mean()
+
+
+def rule_limits(code):
+    rule = next(r for r in HW_RULES if r.code == code)
+    return rule.warning, rule.critical
+
+
+def trends_figure(at):
+    """Six panels: the four hidden faults, N+1 capacity and containment pressure, with their limits."""
+    trend = hardware_trends()
+    fig = make_subplots(rows=3, cols=2, shared_xaxes=True, vertical_spacing=0.1, horizontal_spacing=0.08,
+                        subplot_titles=("CRAH filter ΔP at 100 % fan (Pa)", "CHWP-1 vibration (mm/s RMS)",
+                                        "CH-1 condenser approach (°C)", "Humidity sensor vs CRAH reference (|Δ| %RH)",
+                                        "N+1: one CRAH's capacity vs week-peak IT (kW)", "Cold-aisle over-pressure (Pa)"))
+    fig.add_scatter(x=trend.index, y=trend["filter_1"], name="CRAH-1", line=dict(color=MUTED, width=1.6), row=1, col=1)
+    fig.add_scatter(x=trend.index, y=trend["filter_2"], name="CRAH-2", line=dict(color=CTRL["ai"], width=2), row=1, col=1)
+    fig.add_scatter(x=trend.index, y=trend["vibration"], name="CHWP-1", line=dict(color=CTRL["ai"], width=2), row=1, col=2,
+                    showlegend=False)
+    fig.add_scatter(x=trend.index, y=trend["approach"], name="CH-1", line=dict(color=CTRL["ai"], width=2), row=2, col=1,
+                    showlegend=False)
+    fig.add_scatter(x=trend.index, y=trend["ENV-CA-1"], name="ENV-CA-1", line=dict(color=MUTED, width=1.6), row=2, col=2)
+    fig.add_scatter(x=trend.index, y=trend["ENV-CA-2"], name="ENV-CA-2", line=dict(color=QTY["temp"], width=2), row=2, col=2)
+    fig.add_scatter(x=trend.index, y=trend["cap_2"], name="CRAH-2 capacity", line=dict(color=CTRL["ai"], width=2), row=3, col=1)
+    fig.add_scatter(x=trend.index, y=trend["peak7"], name="Week-peak IT load", line=dict(color=QTY["it"], width=2, shape="hv"),
+                    row=3, col=1)
+    fig.add_scatter(x=trend.index, y=trend["dp"], name="ENV-DP-1", line=dict(color=CTRL["ai"], width=2), row=3, col=2,
+                    showlegend=False)
+    for code, row, col in [("FILTER_LOADING", 1, 1), ("BEARING_WEAR", 1, 2), ("CONDENSER_FOULING", 2, 1), ("SENSOR_DRIFT", 2, 2)]:
+        warning, critical = rule_limits(code)
+        hw_limit(fig, warning, row, col, f"warning {warning:g}", WARN)
+        if code in ("BEARING_WEAR", "CONDENSER_FOULING"):
+            hw_limit(fig, critical, row, col, f"critical {critical:g}", CRIT)
+    hw_limit(fig, rule_limits("CONTAINMENT_PRESSURE")[0], 3, 2, "warning 1", WARN)
+    fig.add_vline(x=at, line=dict(color=INK2, width=1))
+    return style(fig, height=640, title="Four faults hidden in the equipment data, seen days before any rack gets hot")
