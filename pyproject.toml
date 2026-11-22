@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "predictive-cooling"
-version = "0.5.0"
+version = "1.0.0"
 description = "Agent-based predictive cooling: Supervisor + Data Analyst + Security Analyst + Hardware Engineer + Cooling Advisor using sensor and equipment data, an ML forecast, 81-plan MPC, guardrails and attack detection"
 requires-python = ">=3.11"
 dependencies = [

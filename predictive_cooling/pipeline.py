@@ -1,10 +1,11 @@
 """Run the whole study end to end and save what the dashboard shows.
 
-    python -m predictive_cooling.pipeline          # about 1-3 minutes
+    python -m predictive_cooling.pipeline          # about 2-5 minutes
 
 1 sensors -> 2 clean -> 3 train + score forecasters -> tune baselines on validation weeks
 -> 4/5 run Fixed, Rule-based and AI + MPC (+ safety) on the plant (6) in four test scenarios
--> security: train the sensor-integrity model and run two cyber-attack scenarios.
+-> security: train the sensor-integrity model and run two cyber-attack scenarios
+-> hardware upgrades: run every upgrade option on the upgraded plant (rule, today's AI, AI retrained).
 """
 from concurrent.futures import ProcessPoolExecutor
 import itertools
@@ -21,21 +22,53 @@ from threadpoolctl import threadpool_limits
 from . import config as C
 from . import dataset, forecast, preprocess
 from .controllers import AIController, FixedSetpoint, RuleBased
-from .evaluate import all_scenarios, run, scenarios, security_scenarios, summarize
+from .evaluate import Scenario, all_scenarios, run, scenarios, security_scenarios, summarize
 from .hardware import telemetry
+from .hardware.upgrades import UPGRADES, retrained_forecaster
+from .plant import PlantParams
 from .mpc import MPC
 from .safety import SafetyFilter
 from .security.integrity import IntegrityModel, IntegrityMonitor
 
-VERSION = 2                      # 2: sensor-integrity model + cyber-attack scenarios
+VERSION = 3                      # 2: sensor-integrity model + cyber attacks; 3: hardware-upgrade study
 BUNDLE = C.ARTIFACT_DIR / "bundle.pkl"
 CONTROLLER_ORDER = ["fixed", "rule", "ai", "ai_unsafe", "ai_no_integrity"]
 
 
 def _simulate(job):
-    controller, scenario_key, start = job
+    controller, scenario, start = job
     with threadpool_limits(1):
-        return run(controller, all_scenarios()[scenario_key], start=start)
+        return run(controller, scenario if isinstance(scenario, Scenario) else all_scenarios()[scenario], start=start)
+
+
+def _retrain(key):
+    with threadpool_limits(1):
+        return retrained_forecaster(UPGRADES[key].apply(PlantParams()))
+
+
+def upgrade_study(rule_params, fixed_sp, gbm, margins, workers):
+    """Every upgrade on the upgraded plant: rule-based, today's AI and (where it matters) the AI retrained for it."""
+    keys = [k for k, u in UPGRADES.items() if u.retrain]
+    if workers > 1:
+        with ProcessPoolExecutor(workers) as pool:
+            retrained = dict(zip(keys, pool.map(_retrain, keys)))
+    else:
+        retrained = {k: _retrain(k) for k in keys}
+    jobs, labels = [], []
+    for key, upgrade in UPGRADES.items():
+        scenario = Scenario(key, upgrade.title, upgrade.change, params=upgrade.apply(PlantParams()))
+        variants = {"rule": RuleBased(**rule_params), "ai": AIController(MPC(gbm, margins), SafetyFilter(fixed_sp))}
+        if key in retrained:
+            variants["ai_new"] = AIController(MPC(*retrained[key]), SafetyFilter(fixed_sp), name="AI + MPC (retrained)")
+        for variant, controller in variants.items():
+            jobs.append((controller, scenario, C.VAL_END))
+            labels.append((key, variant))
+    logs = _run_all(jobs, workers)
+    rows = []
+    for (key, variant), log in zip(labels, logs):
+        rows.append(summarize(log, variant, variant != "rule") | {
+            "upgrade": key, "variant": variant, "at_ceiling_pct": float(100 * (log["setpoint_in_use"] >= C.SP_MAX).mean())})
+    return pd.DataFrame(rows)
 
 
 def _run_all(jobs, workers):
@@ -96,12 +129,12 @@ def _prediction_samples(models, frame):
 def build(workers=None, log=print):
     started = time.time()
     workers = workers or max(1, min(4, os.cpu_count() or 1))
-    log("1/5 Loading the sensor history (generating it if missing)")
+    log("1/6 Loading the sensor history (generating it if missing)")
     raw = dataset.load()
-    log("2/5 Cleaning sensor data")
+    log("2/6 Cleaning sensor data")
     clean, quality = preprocess.clean(raw)
     train, val, test = preprocess.split(clean)
-    log("3/5 Training forecasters (persistence, linear, gradient boosting)")
+    log("3/6 Training forecasters (persistence, linear, gradient boosting)")
     models = {kind: forecast.Forecaster(kind).fit(train) for kind in forecast.Forecaster.KINDS}
     accuracy = forecast.evaluate(models, test)
     gbm = models["gbm"]
@@ -109,11 +142,11 @@ def build(workers=None, log=print):
     importance = _importance(gbm, test)
     samples = _prediction_samples(models, test)
 
-    log("4/5 Tuning the Fixed and Rule-based baselines on the validation weeks")
+    log("4/6 Tuning the Fixed and Rule-based baselines on the validation weeks")
     fixed_sp, fixed_table = tune_fixed(workers)
     rule_params, rule_table = tune_rule(workers)
 
-    log("5/5 Closed-loop tests on the plant: 4 scenarios x 3 controllers (+ AI without safety filter), "
+    log("5/6 Closed-loop tests on the plant: 4 scenarios x 3 controllers (+ AI without safety filter), "
         "2 cyber attacks x 4 controllers (+ AI without integrity check)")
     integrity = IntegrityModel.from_data(clean, telemetry.load())
     mpc = MPC(gbm, margins)
@@ -126,12 +159,16 @@ def build(workers=None, log=print):
     logs = dict(zip(keys, _run_all([(controllers[c], s, C.VAL_END) for s, c in keys], workers)))
     summary = pd.DataFrame([summarize(logs[s, c], controllers[c].name, controllers[c].kind == "ai") | {"scenario": s, "key": c}
                             for s, c in keys])
+    log("6/6 Hardware upgrades: each option on the upgraded plant (rule-based, today's AI, AI retrained)")
+    upgrades = upgrade_study(rule_params, fixed_sp, gbm, margins, workers)
+    days = len(logs["normal", "ai"]) / C.STEPS_PER_DAY
 
     bundle = dict(
         version=VERSION, sklearn=sklearn.__version__, built_seconds=round(time.time() - started, 1),
         raw=raw, clean=clean, quality=quality, accuracy=accuracy, margins=margins, importance=importance,
         samples=samples, forecaster=gbm, integrity=integrity, fixed_sp=fixed_sp, fixed_table=fixed_table, rule_params=rule_params,
         rule_table=rule_table, rule_text=RuleBased(**rule_params).describe(), logs=logs, summary=summary,
+        upgrades=dict(table=upgrades, days=days, baseline=summary.set_index(["scenario", "key"]).loc[("normal", "ai")].to_dict()),
         controller_names={k: v.name for k, v in controllers.items()},
     )
     C.ARTIFACT_DIR.mkdir(exist_ok=True)
@@ -139,6 +176,7 @@ def build(workers=None, log=print):
         pickle.dump(bundle, fh)
     accuracy.round(3).to_csv(C.ARTIFACT_DIR / "forecast_accuracy.csv", index=False)
     summary.round(3).to_csv(C.ARTIFACT_DIR / "closed_loop_results.csv", index=False)
+    upgrades.round(3).to_csv(C.ARTIFACT_DIR / "upgrade_study.csv", index=False)
     quality.to_csv(C.ARTIFACT_DIR / "data_quality.csv")
     log(f"Done in {bundle['built_seconds']} s -> {BUNDLE.relative_to(C.ROOT)}")
     return bundle

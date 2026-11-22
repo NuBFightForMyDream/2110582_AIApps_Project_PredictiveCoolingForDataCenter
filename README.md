@@ -3,28 +3,112 @@
 
 > **"If the load will rise in 30 minutes, how should we adjust the cooling right now so the racks stay below the limit and we use as little electricity as possible?"**
 
-An **agent-based** system: five agents (Supervisor, Data Analyst, Security Analyst, Hardware Engineer, Cooling Advisor) answer
-an operator's question about the room by calling guarded Python tools. The tools are the proposal's pipeline: sensor data → cleaning → ML
-forecast → 81-plan MPC → safety filter, with a simulated room (plant) as the judge, plus a **hardware layer**: a sensor gateway
-that polls 22 field devices over BACnet/IP, Modbus TCP and SNMP v3, and diagnostics that tell the agents when the equipment
-itself (filters, pumps, chiller, sensors) is going wrong, and a **security layer**: an ML integrity model and replay detection
-that catch forged sensor data, a prompt-injection screen, signed recommendations and a hash-chained audit trail. The original agent architecture is kept: LangGraph, skills S1–S5,
-guardrails G1/G2/G3, and offline or Gemini mode. What changed is what the agents work with. They now read **sensor data from the
-data center**, use a **forecaster trained on a mock sensor dataset**, and choose a setpoint with **MPC**. Infrastructure that was
-not needed for the idea (FastAPI, Supabase/auth, SustainDC install, CSV import) is removed.
+An **agent-based** predictive cooling system for a mock 12-rack server room. Every 15 minutes a machine-learning forecaster
+and an 81-plan MPC pick the warmest supply-air setpoint that keeps every rack inlet at or below 27 °C, and six safety rules can
+override them. **Five AI agents** (Supervisor, Data Analyst, Security Analyst, Hardware Engineer, Cooling Advisor) answer an
+operator's questions by calling guarded Python tools, and **four guards** (G1–G4) check everything they do. Around the loop:
 
-## The idea in 30 seconds
+- a **hardware layer**: 22 field devices read over BACnet/IP, Modbus TCP and SNMP v3, with diagnostics that see equipment faults days early;
+- a **security layer**: an ML integrity model and replay detection that catch forged sensor data, a prompt-injection screen, signed answers;
+- an **upgrade advisor**: every hardware option measured in closed loop together with the AI, ranked by payback;
+- a **12-page dashboard** (Streamlit) that shows all of it, with the installed model of every device and sensor.
 
-| The problem | The idea | The result |
-|---|---|---|
-| Server rooms run their cooling at a safe but cold setpoint all day. Colder than needed = wasted electricity. | Every 15 minutes: **forecast the next hour**, try **81 setpoint plans**, keep only the ones that stay below 27 °C, and pick the cheapest. | **2.1 % less cooling energy** than a tuned rule-based controller (5.0 % vs a fixed setpoint), **0 minutes** above 27 °C. |
+## At a glance
+
+Results on the two test weeks the AI never trained on (20 Apr – 3 May 2026), scored by the simulated room:
+
+| | Result |
+|---|---|
+| **Energy** | **2.1 % less cooling energy** than a tuned rule-based controller (5.0 % vs a fixed setpoint), **0 minutes** above 27 °C |
+| **Safety** | B5/B6 sensors offline during the GPU batch: **0 minutes** above 27 °C (rule-based 210, the AI without its safety filter 240) |
+| **Security** | Forged GPU-rack readings: **0 minutes** above 27 °C (the AI without the integrity check 465); replayed readings: **0** (390) |
+| **Hardware** | A clogging filter, a worn pump bearing, a fouled condenser and a drifting sensor are flagged **2–6 days** before their warning limit; 0 false alarms in the healthy weeks |
+| **Upgrades** | All options together save **9.3 %** of facility energy (≈ 427k THB and 46.7 tCO₂ a year); the UPS energy-saver mode pays back in 0.2 years |
+
+**Contents:** [Quick start](#quick-start) · [Architecture](#architecture) · [The control loop](#the-control-loop) ·
+[Agents and guards](#agents-and-guards) · [Hardware layer](#hardware-layer-predictive_coolinghardware) ·
+[Security layer](#security-layer-predictive_coolingsecurity) · [Equipment, flows and upgrades](#equipment-flows-and-upgrades-physical--ai) ·
+[Dashboard](#dashboard) · [Deploy](#deploy) · [Limitations](#limitations) · [Documentation and file layout](#documentation-and-file-layout) ·
+[Sources](#sources)
+
+## Quick start
+
+Requires Python 3.11+. Developed on 3.14; a fresh 3.13 environment built only from `requirements.txt` loads the committed
+study and passes all 117 tests. `requirements.txt` pins exact versions because the committed `artifacts/bundle.pkl` is only
+reused when scikit-learn matches; otherwise the first start rebuilds it (2–5 minutes).
+
+```bash
+python3 -m venv .venv
+```
+
+```bash
+.venv/bin/pip install -r requirements.txt
+```
+
+```bash
+.venv/bin/python -m predictive_cooling
+```
+
+The last command opens the dashboard at http://localhost:8501 (if `artifacts/bundle.pkl` is missing or was built with
+another scikit-learn, it first trains and tests everything, about 2–5 minutes).
+To run only the pipeline and print the result tables:
+
+```bash
+.venv/bin/python -m predictive_cooling.pipeline
+```
+
+Ask the agents from the command line:
+
+```bash
+.venv/bin/python -m predictive_cooling.agents --at "2026-04-21 00:30"
+```
+
+```bash
+.venv/bin/python -m predictive_cooling.agents --at "2026-04-29 05:30"
+```
+
+```bash
+.venv/bin/python -m predictive_cooling.agents --at "2026-04-21 00:30" --equipment-fault CRAH-1
+```
+
+```bash
+.venv/bin/python -m predictive_cooling.agents --at "2026-04-21 02:00" --attack spoofing
+```
+
+```bash
+.venv/bin/python -m predictive_cooling.agents --at "2026-04-29 05:30" --mode upgrade
+```
+
+Regenerate the data, the study or the README figures (all deterministic; seeds are fixed):
+
+```bash
+.venv/bin/python -m predictive_cooling.dataset     # data/sensor_history.csv
+.venv/bin/python -m predictive_cooling.hardware    # data/equipment_telemetry.csv
+.venv/bin/python -m predictive_cooling.pipeline    # artifacts/bundle.pkl (≈ 2 min)
+.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python scripts/make_figures.py   # docs/*.png
+```
+
+Tests (117 tests including headless smoke tests of every dashboard page, about 2 minutes):
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+## Architecture
+
+![architecture](docs/architecture.png)
+
+The same Python steps do two jobs. Every 15 minutes they **run the room** in closed loop (the control layer, scored on the
+simulated plant). On demand, the **agents call them as tools** to answer an operator's question, and the guards check every
+call and recompute the answer before it is released. The hardware and security layers feed both: rule R5 (hardware) and
+rule R6 (untrusted data) sit inside the same safety filter.
 
 ```mermaid
 flowchart LR
     S["① Sensors<br/>12 rack inlets, power,<br/>weather · every 15 min"]:::step --> CL["② Clean<br/>gaps, glitches,<br/>stuck sensors"]:::step
     CL --> F["③ Forecast (ML)<br/>next 60 min for<br/>any setpoint plan"]:::ai
     F --> M["④ MPC<br/>try 81 plans → keep safe<br/>→ pick cheapest"]:::ai
-    M --> SF["⑤ Safety filter<br/>4 rules check<br/>every command"]:::guard
+    M --> SF["⑤ Safety filter<br/>6 rules check<br/>every command"]:::guard
     SF --> P["⑥ Room<br/>apply the setpoint,<br/>repeat in 15 min ↺"]:::ok
     classDef step fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
     classDef ai fill:#e8f1fc,stroke:#2a78d6,color:#0b0b0b,stroke-width:2px
@@ -34,9 +118,175 @@ flowchart LR
 
 Blue = machine learning, red = safety, green = what reaches the room.
 
-![architecture](docs/pipeline.png)
+Blue = machine learning, red = safety, green = what reaches the room. Detailed component documents: [architecture/](architecture/README.md).
 
-## Two layers
+## The control loop
+
+### Mock dataset: `data/sensor_history.csv`
+
+A simulated 12-rack server room (two rows facing one shared cold aisle, CRAH units on the left wall), 2 Feb – 3 May 2026,
+one reading every 15 minutes: **8,718 rows × 25 sensors** (about 1.6 MB, opens in Excel).
+
+![floor map](docs/floor-map.png)
+
+| Column | Unit | Meaning |
+|---|---|---|
+| `outdoor_temp_c` | °C | Outdoor air temperature (hot, humid Bangkok-like climate, warming toward April, afternoon storms) |
+| `it_load_pct`, `it_power_kw` | %, kW | Average CPU/GPU load and server power (including the fans inside the servers) |
+| `inlet_A1_c` … `inlet_B6_c` | °C | Air temperature at the front of each rack: **must stay at or below 27 °C** (ASHRAE) |
+| `supply_air_c`, `return_air_c` | °C | Cold air leaving the CRAH units / hot air coming back |
+| `crah_setpoint_c` | °C | **The one knob the AI controls**: supply-air setpoint (16–24 °C) |
+| `crah_fan_pct` | % | CRAH fan speed (automatic, follows load) |
+| `chiller_kw`, `crah_fan_kw`, `pump_tower_kw`, `cooling_kw` | kW | Cooling sub-meters |
+| `facility_kw`, `pue` | kW, – | Whole-building power and PUE = facility ÷ IT |
+
+How the data is made (`predictive_cooling/dataset.py`):
+
+- **Workload**: office-hour demand, a **GPU training batch every weekday night 01:00–05:00** (racks B4–B6), an afternoon reporting job, and random unplanned jobs.
+- **Plant**: `plant.py` is a simple physics model. Hot air recirculates (B6 at the end of the row is the hottest), the room has a thermal lag of about 25 minutes,
+  the chiller COP improves by about 4 % per °C of higher setpoint, and server fans speed up when the inlet goes above 26 °C (so IT power rises).
+- **Previous operator**: a simple rule ran the room and **occasionally ran setpoint step tests**, so the history contains many setpoint levels.
+  (If the setpoint never changed, the model could not learn what the setpoint does.)
+- **Real-world problems added on purpose**: 0.3 % missing values, glitch readings of 85/−40/0 °C, sensor A3 stuck for 8 hours, and 2 logger outages (18 rows).
+
+Regenerate it with `python -m predictive_cooling.dataset` (seeds are fixed, so the result is identical every time).
+
+Cleaning and the time-based split (never shuffle a time series: the model is scored on weeks it never saw):
+
+```mermaid
+flowchart LR
+    R["Raw log"]:::step --> A["1 · back on the<br/>15-min grid"]:::step --> B["2 · impossible<br/>values → missing"]:::guard
+    B --> S["3 · stuck sensor<br/>(6+ repeats) → missing"]:::guard --> F["4 · fill holes<br/>≤ 1 hour"]:::step
+    F --> T["Train<br/>weeks 1–9"]:::ai
+    F --> V["Validate<br/>weeks 10–11"]:::step
+    F --> X["Test<br/>weeks 12–13"]:::ok
+    classDef step fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
+    classDef ai fill:#e8f1fc,stroke:#2a78d6,color:#0b0b0b,stroke-width:2px
+    classDef guard fill:#fbeeee,stroke:#d03b3b,color:#0b0b0b
+    classDef ok fill:#e6f6ef,stroke:#1baf7a,color:#0b0b0b
+```
+
+### The steps in code
+
+| Step | File | What it does |
+|---|---|---|
+| ① | `dataset.py` | Builds the workload, weather, operating history and log faults |
+| ② | `preprocess.py` | Reindexes to the full 15-minute grid → removes impossible values → catches stuck sensors (same value ≥ 6 times) → fills holes up to 1 hour, then splits by time into train (weeks 1–9), validation (10–11) and test (12–13) |
+| ③ | `forecast.py` | Compares 3 models: **Persistence** (baseline), **Linear** and **Gradient Boosting** with physics-based monotonic constraints (higher setpoint → warmer racks, less chiller power). One model per target × horizon (3 × 4) |
+| ④ | `mpc.py` | Builds the 81 plans, forecasts each one, rejects plans where `forecast + safety margin > 27 °C`, and picks the plan with the lowest cooling + IT energy. The margin is the 99th percentile of how much the model under-predicted on the validation weeks |
+| ④ | `controllers.py` | Fixed / Rule-based / AI, plus **feedback correction**: the last forecast error is added to the next forecast (helps when the room drifts away from the training data) |
+| ⑤ | `safety.py` | R1 missing sensor → fallback, R2 unfamiliar conditions → fallback, R3 near the limit → cool by 2 °C now, R4 at most ±1 °C per 15 minutes and within 16–24 °C (fallback = the previous fixed setpoint, proven safe) |
+| ⑥ | `plant.py`, `evaluate.py` | The simulated room is the judge: 14-day closed-loop runs in 4 scenarios |
+| | `pipeline.py` | Runs every step end to end and tunes the baselines on validation (fixed = highest setpoint that never overheated, rule = lowest-energy deadband that never overheated) |
+| | `security/` | Security layer: `integrity.py` (ML integrity model, replay, closed-loop monitor), `commands.py` (command audit + verdict), `attacks.py` (simulated attacks), `prompt_guard.py` (G1/G4), `signing.py`, `audit.py`, `ratelimit.py`, `posture.py` (protocols + STRIDE) |
+| | `hardware/` | Hardware layer: `registry.py` (22 devices, point map), `gateway.py` (poll + decode + quality), `telemetry.py` (equipment historian + injected faults), `diagnostics.py` (limits, trends, N+1, constraint), `catalog.py` (installed models, instruments, upgrade products + sources), `flows.py` (power/heat balance), `upgrades.py` + `advisor.py` (closed-loop upgrade study, payback ranking) |
+| | `agents/` | Agent layer: `engine.py` (LangGraph, G1–G4, S5), `tools.py` (the tools above), `llm_loops.py` (function-calling loops), `gemini.py` + `claude.py` (providers), `skills.py` + `skill_specs/` (S1–S7) |
+| | `app.py`, `app_pages/`, `ui/` | Dashboard: the entry point (navigation, sidebar moment), one file per page, shared helpers and illustrations |
+
+### Results (2 test weeks the model never saw)
+
+#### ③ Forecast accuracy
+
+| Model | Inlet MAE 15 min | 30 min | 45 min | 60 min | Cooling NRMSE 60 min |
+|---|---|---|---|---|---|
+| Persistence (no AI) | 0.31 °C | 0.48 | 0.61 | 0.71 | 10.0 % |
+| Linear regression | 0.19 °C | 0.25 | 0.30 | 0.34 | 7.0 % |
+| **Gradient boosting** | **0.17 °C** | **0.17** | **0.18** | **0.18** | **3.5 %** |
+
+This meets the proposal targets (MAE ≤ 1 °C at 15 minutes, NRMSE ≤ 10 %). Persistence is always late: it only notices the GPU batch after it has started.
+The ML model learned from history that the batch starts at 01:00 on weekdays, so it sees it coming.
+
+![forecast](docs/forecast-vs-actual.png)
+
+#### ④ How the MPC chooses
+
+Like a GPS: try every route for the next hour, drop the ones that overheat, take the cheapest, drive only the first
+15 minutes, then plan again with fresh data.
+
+```mermaid
+flowchart LR
+    N["Setpoint now"]:::step --> C["Each 15 min:<br/>−1, 0 or +1 °C"]:::step
+    C --> P["4 steps → 3⁴ =<br/>81 plans"]:::step
+    P --> F["Forecast every plan"]:::ai
+    F --> D{"peak + safety margin<br/>≤ 27 °C?"}:::guard
+    D -- no --> X["Rejected"]:::guard
+    D -- yes --> E["Cheapest safe plan<br/>(least kWh)"]:::ok
+    E --> A["Apply only<br/>its first step"]:::ok
+    classDef step fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
+    classDef ai fill:#e8f1fc,stroke:#2a78d6,color:#0b0b0b,stroke-width:2px
+    classDef guard fill:#fbeeee,stroke:#d03b3b,color:#0b0b0b
+    classDef ok fill:#e6f6ef,stroke:#1baf7a,color:#0b0b0b
+```
+
+Example at 00:30, just before the GPU batch: 18 of the 81 plans are safe, and the cheapest is 21 → 21 → 21 → 22 °C.
+It lowers the setpoint by 1 °C first to pre-cool for the 01:00 job.
+
+![mpc](docs/mpc-81-plans.png)
+
+#### ⑥ Controllers compared (normal operation, 14 days)
+
+| | Fixed 20 °C | Rule-based (tuned) | **AI + MPC** |
+|---|---|---|---|
+| Cooling energy | 12,512 kWh | 12,144 kWh | **11,892 kWh** |
+| Facility energy (incl. the 0.2 kW AI server running 24/7) | 44,687 kWh | 44,319 kWh | **44,141 kWh** |
+| PUE | 1.489 | 1.477 | **1.471** |
+| Minutes with inlet > 27 °C | 0 | 0 | **0** |
+| Average setpoint | 20.0 °C | 21.4 °C | 22.4 °C |
+| Decision time per step | – | – | 24 ms (target < 10 s) |
+
+```mermaid
+xychart-beta
+    title "Cooling energy over 14 test days (kWh, lower is better)"
+    x-axis ["Fixed 20 °C", "Rule-based", "AI + MPC"]
+    y-axis "kWh" 11500 --> 12700
+    bar [12512, 12144, 11892]
+```
+
+The axis starts at 11,500 kWh to make the gap visible; most cooling energy is needed whatever the setpoint.
+
+**Summary:** the AI cuts cooling energy by **5.0 %** vs the fixed setpoint and **2.1 %** vs the tuned rule-based controller.
+Whole-building energy drops by 1.22 % / 0.40 % (about 57,000 / 18,500 THB per year at 4 THB/kWh), with no overheating at any point.
+
+![results](docs/results-day.png)
+
+> **An honest reading:** the proposal targeted ≥ 10 % cooling savings vs a tuned rule-based controller. In this simulated room the AI **falls short at 2.1 %** because:
+> (1) rack B6 is a hot spot and the hottest rack 100 % of the time, which caps how warm the room can run;
+> (2) inlets above 26 °C make the server fans speed up, so warmer is not always cheaper (the model knows this and stops);
+> (3) the setpoint is the only control knob.
+> Next steps: fix the airflow at B6 (blanking panels/containment) or add knobs such as chilled-water temperature and fan speed.
+
+#### ⑤ Fault tests (minutes with inlet > 27 °C)
+
+The AI only *proposes*; four rules can override it before anything is sent (**R5** applies the Hardware Engineer's
+constraint in agent cases, **R6** withholds the AI when the data fails the integrity check; see the hardware and security layers above):
+
+```mermaid
+flowchart LR
+    P["MPC proposal"]:::ai --> R1{"R1 · sensor<br/>missing?"}:::guard
+    R1 -- yes --> FB["Fallback setpoint"]:::ok
+    R1 -- no --> R2{"R2 · conditions never<br/>seen in training?"}:::guard
+    R2 -- yes --> FB
+    R2 -- no --> R3{"R3 · rack already<br/>near 27 °C?"}:::guard
+    R3 -- yes --> CO["Cool 2 °C now"]:::ok
+    R3 -- no --> R4["R4 · max ±1 °C per step,<br/>stay within 16–24 °C"]:::guard
+    R4 --> SEND["Send command"]:::ok
+    classDef ai fill:#e8f1fc,stroke:#2a78d6,color:#0b0b0b,stroke-width:2px
+    classDef guard fill:#fbeeee,stroke:#d03b3b,color:#0b0b0b
+    classDef ok fill:#e6f6ef,stroke:#1baf7a,color:#0b0b0b
+```
+
+| Scenario | Fixed | Rule-based | AI + MPC | AI without safety filter |
+|---|---|---|---|---|
+| Normal | 0 | 0 | 0 | – |
+| **B5/B6 sensors go offline** during the GPU batch | 0 | 210 | **0** (28 fallback steps) | 240 |
+| **Room changed after training** (+20 % recirculation, chiller 10 % worse) | 1,980 | 150 | **60** | – |
+| **Unplanned load surge** (+45–50 % on the GPU racks) | 0 | 0 | 15 (peak 27.03 °C) | – |
+
+- The safety filter matters: without it, the AI trusts the remaining (cooler) sensors and lets the room overheat for 240 minutes.
+- When the room changes, feedback correction cuts overheating from 240 to 60 minutes, but short exceedances remain when the batch starts. That is a signal to retrain.
+- Nobody can forecast a job that has never happened before. The AI runs closer to the limit, so it is hit harder in the first 15 minutes; then R3 cools by 2 °C immediately.
+
+## Agents and guards
 
 ```mermaid
 flowchart TD
@@ -68,7 +318,7 @@ flowchart TD
 | Supervisor (parent) | S1 Plan, S5 Compose | `call_data_analyst`, `call_security_analyst`, `call_hardware_engineer`, `call_cooling_advisor`, `finish_case` |
 | Data Analyst (child) | S2 Inspect, S3 Analyze & Forecast | `read_sensors`, `inspect_data_quality`, `summarize_state`, `forecast_hold`, `finish_analysis` |
 | Security Analyst (child) | S7 Verify data integrity | `check_sensor_integrity`, `audit_command_channel`, `finish_security_review` |
-| Hardware Engineer (child) | S6 Inspect equipment health | `read_equipment`, `diagnose_equipment`, `finish_equipment_check` |
+| Hardware Engineer (child) | S6 Inspect equipment health, S8 Plan upgrades (task `upgrade`) | `read_equipment`, `diagnose_equipment`, `evaluate_upgrades`, `finish_equipment_check` |
 | Cooling Advisor (child) | S4 Evaluate plans | `run_mpc`, `check_safety`, `propose_setpoint` |
 
 | Guard | Where | Checks | Stops with |
@@ -77,6 +327,28 @@ flowchart TD
 | G2 | Every tool call and delegation | Skill owner + tool allowlist, phase (e.g. no MPC before inspection, no Cooling Advisor before the Hardware Engineer), shared tool/model budget, deadline. Tools only see readings **at or before** the case time (2 h of sensors, 7 days of equipment data) | `TOOL_NOT_ALLOWED`, `budget_exceeded` |
 | G3 | After the agents, before release | Re-reads the sensors, re-inspects quality, **re-runs the integrity checks**, **re-polls every device and re-runs the hardware diagnosis**, recomputes state, forecast, MPC and safety filter; proposal must equal the recomputed setpoint; range/rate limit; hardware constraint respected; plan safe | `security_alert` (→ R6), `insufficient_data` (→ R1 fallback), `PROPOSAL_EVIDENCE_MISMATCH`, `EQUIPMENT_EVIDENCE_MISMATCH`, `SECURITY_EVIDENCE_MISMATCH` |
 | G4 | After S5, on release | Redacts keys, links and e-mails from model notes and flags claims that equipment was changed; HMAC-signs the recommendation (15-min expiry, one-time nonce); seals the trace in a SHA-256 hash chain | – |
+
+| Skill | Owner | Procedure |
+|---|---|---|
+| S1 Plan case | Supervisor | Delegate in order: Data Analyst → Security Analyst → Hardware Engineer → Cooling Advisor (only if data ready, trusted and the task is *recommend*) |
+| S2 Inspect sensor data | Data Analyst | Read the last 2 h; gaps, impossible values, stuck and missing sensors |
+| S3 Analyze & forecast | Data Analyst | Hottest rack, headroom, power, PUE; forecast the next hour if the setpoint is held |
+| S4 Evaluate setpoint plans | Cooling Advisor | 81-plan MPC, safety filter (incl. R5/R6), propose exactly what the tools support |
+| S5 Compose recommendation | Supervisor | Deterministic statement from verified evidence only |
+| S6 Inspect equipment health | Hardware Engineer | Poll 22 devices, limits, 7-day trends, N+1, cooling constraint |
+| S7 Verify data integrity | Security Analyst | Integrity model, replay check, command-channel audit → trusted / untrusted |
+| S8 Plan upgrades | Hardware Engineer | Maintenance first, then hardware options ranked by payback (task *upgrade*) |
+
+Safety rules (step ⑤; R5 and R6 also apply in every agent case):
+
+| Rule | When | Then |
+|---|---|---|
+| R1 Missing data | Any rack inlet sensor is missing | Head to the proven fallback setpoint (20 °C), 1 °C per step |
+| R2 Unfamiliar | Inputs far outside the training data | Fallback setpoint |
+| R6 Untrusted | The integrity check flags forged or replayed data, or an unauthorised setpoint write | Never warmer than now or than the fallback |
+| R5 Hardware | The Hardware Engineer reports a cooling-path problem | `no_raise`: never warmer than now; `fallback`: also never warmer than the fallback |
+| R3 Too hot now | Measured hottest inlet within 0.3 °C of 27 °C | Cool by 2 °C at once |
+| R4 Limits | Always | At most ±1 °C per 15 minutes (2 °C down under R3), within 16–24 °C |
 
 **Modes.** *Offline*: LangGraph runs fixed role procedures, no LLM, deterministic. *Gemini*: real parent/child function
 calling (separate histories, one tool per turn, phase-limited tool lists, shared budgets). Set `GEMINI_API_KEY` (and optionally
@@ -121,50 +393,6 @@ safety rule R1 moves toward the 20 °C fallback. At `--at "2026-04-29 05:30"` th
 20 °C. With `--attack spoofing` at 21 Apr 02:00 the Security Analyst sees B4–B6 reading ~2.9 °C cooler than their PDU power allows:
 status `security_alert`, the AI is withheld and R6 keeps the room no warmer than now.
 
-## Mock dataset: `data/sensor_history.csv`
-
-A simulated 12-rack server room (two rows facing one shared cold aisle, CRAH units on the left wall), 2 Feb – 3 May 2026,
-one reading every 15 minutes: **8,718 rows × 25 sensors** (about 1.6 MB, opens in Excel).
-
-![floor map](docs/floor-map.png)
-
-| Column | Unit | Meaning |
-|---|---|---|
-| `outdoor_temp_c` | °C | Outdoor air temperature (hot, humid Bangkok-like climate, warming toward April, afternoon storms) |
-| `it_load_pct`, `it_power_kw` | %, kW | Average CPU/GPU load and server power (including the fans inside the servers) |
-| `inlet_A1_c` … `inlet_B6_c` | °C | Air temperature at the front of each rack: **must stay at or below 27 °C** (ASHRAE) |
-| `supply_air_c`, `return_air_c` | °C | Cold air leaving the CRAH units / hot air coming back |
-| `crah_setpoint_c` | °C | **The one knob the AI controls**: supply-air setpoint (16–24 °C) |
-| `crah_fan_pct` | % | CRAH fan speed (automatic, follows load) |
-| `chiller_kw`, `crah_fan_kw`, `pump_tower_kw`, `cooling_kw` | kW | Cooling sub-meters |
-| `facility_kw`, `pue` | kW, – | Whole-building power and PUE = facility ÷ IT |
-
-How the data is made (`predictive_cooling/dataset.py`):
-
-- **Workload**: office-hour demand, a **GPU training batch every weekday night 01:00–05:00** (racks B4–B6), an afternoon reporting job, and random unplanned jobs.
-- **Plant**: `plant.py` is a simple physics model. Hot air recirculates (B6 at the end of the row is the hottest), the room has a thermal lag of about 25 minutes,
-  the chiller COP improves by about 4 % per °C of higher setpoint, and server fans speed up when the inlet goes above 26 °C (so IT power rises).
-- **Previous operator**: a simple rule ran the room and **occasionally ran setpoint step tests**, so the history contains many setpoint levels.
-  (If the setpoint never changed, the model could not learn what the setpoint does.)
-- **Real-world problems added on purpose**: 0.3 % missing values, glitch readings of 85/−40/0 °C, sensor A3 stuck for 8 hours, and 2 logger outages (18 rows).
-
-Regenerate it with `python -m predictive_cooling.dataset` (seeds are fixed, so the result is identical every time).
-
-Cleaning and the time-based split (never shuffle a time series: the model is scored on weeks it never saw):
-
-```mermaid
-flowchart LR
-    R["Raw log"]:::step --> A["1 · back on the<br/>15-min grid"]:::step --> B["2 · impossible<br/>values → missing"]:::guard
-    B --> S["3 · stuck sensor<br/>(6+ repeats) → missing"]:::guard --> F["4 · fill holes<br/>≤ 1 hour"]:::step
-    F --> T["Train<br/>weeks 1–9"]:::ai
-    F --> V["Validate<br/>weeks 10–11"]:::step
-    F --> X["Test<br/>weeks 12–13"]:::ok
-    classDef step fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
-    classDef ai fill:#e8f1fc,stroke:#2a78d6,color:#0b0b0b,stroke-width:2px
-    classDef guard fill:#fbeeee,stroke:#d03b3b,color:#0b0b0b
-    classDef ok fill:#e6f6ef,stroke:#1baf7a,color:#0b0b0b
-```
-
 ## Hardware layer: `predictive_cooling/hardware/`
 
 The room log above is what a BMS summary shows. The **equipment historian** `data/equipment_telemetry.csv` is what the
@@ -206,6 +434,8 @@ flowchart LR
 - **Cooling constraint** → **safety rule R5**: a cooling-path warning (`no_raise`) means *never warmer than now*; a failure with no
   backup (`fallback`), e.g. a tripped CRAH, means *never warmer than now or than the fallback setpoint*. A critical pump with a
   healthy standby is `no_raise` (switch pumps). Advisory findings (UPS, humidity, sensor drift) do not constrain cooling.
+![hardware trends](docs/hardware-trends.png)
+
 - **Faults hidden in the test weeks** (they show in the equipment data days before any rack gets hot). First appearance, checked hourly:
 
   | Fault (starts) | Watch | Warning | Critical |
@@ -261,178 +491,83 @@ flowchart LR
 | **Sensor spoofing**: B4–B6 read 2.5 °C cooler, 21 & 28 Apr 00:30–05:30 | 0 | 450 | 465 (peak 28.21 °C) | **0** (46 steps held by R6) |
 | **Replay**: 27 Apr plays back Sunday night, 30 Apr plays back the evening before | 0 | 435 | 390 (peak 29.21 °C) | **0** (46 steps held by R6) |
 
+![attacks](docs/attacks.png)
+
 Minutes with a true rack inlet above 27 °C. The integrity monitor never fires in the four non-attack scenarios, so the AI's
 commands and every result above are identical with and without it. Limits: a forgery smaller than ~1 °C is not caught (the
 forecaster's safety margin absorbs most of it), and an attacker who controls both the BMS and the PDU network is out of scope.
 
-## The steps in code
+## Equipment, flows and upgrades (physical + AI)
 
-| Step | File | What it does |
+**What is installed** (`hardware/catalog.py`, shown on the *Live plant* page with links). Named products are real product
+families with the vendor-published facts used here (checked Nov 2026); legacy units without a verified model are described
+by class. The plant model's own numbers (capacity, COP, fan power) are this project's, not datasheet values.
+
+| Where | Installed | Facts used |
 |---|---|---|
-| ① | `dataset.py` | Builds the workload, weather, operating history and log faults |
-| ② | `preprocess.py` | Reindexes to the full 15-minute grid → removes impossible values → catches stuck sensors (same value ≥ 6 times) → fills holes up to 1 hour, then splits by time into train (weeks 1–9), validation (10–11) and test (12–13) |
-| ③ | `forecast.py` | Compares 3 models: **Persistence** (baseline), **Linear** and **Gradient Boosting** with physics-based monotonic constraints (higher setpoint → warmer racks, less chiller power). One model per target × horizon (3 × 4) |
-| ④ | `mpc.py` | Builds the 81 plans, forecasts each one, rejects plans where `forecast + safety margin > 27 °C`, and picks the plan with the lowest cooling + IT energy. The margin is the 99th percentile of how much the model under-predicted on the validation weeks |
-| ④ | `controllers.py` | Fixed / Rule-based / AI, plus **feedback correction**: the last forecast error is added to the next forecast (helps when the room drifts away from the training data) |
-| ⑤ | `safety.py` | R1 missing sensor → fallback, R2 unfamiliar conditions → fallback, R3 near the limit → cool by 2 °C now, R4 at most ±1 °C per 15 minutes and within 16–24 °C (fallback = the previous fixed setpoint, proven safe) |
-| ⑥ | `plant.py`, `evaluate.py` | The simulated room is the judge: 14-day closed-loop runs in 4 scenarios |
-| | `pipeline.py` | Runs every step end to end and tunes the baselines on validation (fixed = highest setpoint that never overheated, rule = lowest-energy deadband that never overheated) |
-| | `security/` | Security layer: `integrity.py` (ML integrity model, replay, closed-loop monitor), `commands.py` (command audit + verdict), `attacks.py` (simulated attacks), `prompt_guard.py` (G1/G4), `signing.py`, `audit.py`, `ratelimit.py`, `posture.py` (protocols + STRIDE) |
-| | `hardware/` | Hardware layer: `registry.py` (22 devices, point map), `gateway.py` (poll + decode + quality), `telemetry.py` (equipment historian + injected faults), `diagnostics.py` (limits, trends, N+1, constraint) |
-| | `agents/` | Agent layer: `engine.py` (LangGraph, G1–G4, S5), `tools.py` (the tools above), `llm_loops.py` (function-calling loops), `gemini.py` + `claude.py` (providers), `skills.py` + `skill_specs/` (S1–S7) |
-| | `app.py` | Dashboard: “Ask the agents” tab + 6 tabs, one per step |
+| CRAH-1/2 | Legacy chilled-water CRAH, AC belt-driven fans (class) | 140 kW sensible, 34,000 m³/h each (site model) |
+| CH-1 | Fixed-speed water-cooled screw chiller, 250 kW (class) | COP 3.6 at reference (site model) |
+| UPS-1 | Eaton 93PM 200 kVA | up to 97 % double conversion, > 99 % in ESS mode |
+| Rack PDUs ×12 | Raritan PX3 | ±1 % billing-grade metering, SNMPv3 |
+| Rack inlets ×12 / cold aisle | APC NetBotz AP9335T / AP9335TH | ±2 °C; ±4 %RH (20–90 %RH at 25 °C) |
+| Containment ΔP | Setra Model 264, 0–0.1 in. W.C. | ±1 % FS (listed as discontinued: plan a replacement) |
+| Sub-meters | Schneider PowerLogic PM5560 | Class 0.2S, Modbus TCP + BACnet/IP |
+| Chilled-water flow | Siemens SITRANS F M MAG 5100 W + MAG 5000 | ±0.4 % of rate |
+| Pump vibration | ifm VKV021 | 0–25 mm/s RMS, 4–20 mA, to DIN ISO 10816 |
 
-## Results (2 test weeks the model never saw)
+**Flows** (`hardware/flows.py`): at any moment, the *Live plant* page draws the plant (roof, plant room, data hall,
+electrical room) with live values and model names on hover, plus two Sankey diagrams: where the electricity goes (grid →
+UPS → rack groups, chiller, CRAH fans, pumps + tower, lighting) and where the heat goes (servers + fans + walls → chilled
+water → chiller → condenser water → cooling tower → outdoor air). Both balance exactly.
 
-### ③ Forecast accuracy
+**Upgrade advisor** (`hardware/upgrades.py`, `hardware/advisor.py`). Each option changes the plant model conservatively
+against the vendor claims, and runs the two test weeks on the upgraded room with the rule-based controller (*hardware
+alone*), with today's AI and, where the room's behaviour changes, with the AI **retrained** on a simulated history of the
+upgraded room (*physical + AI*, ~3 s to retrain). Savings are measured by the plant against today's AI on today's room
+(1,151 MWh/yr facility, PUE 1.471) and annualised:
 
-| Model | Inlet MAE 15 min | 30 min | 45 min | 60 min | Cooling NRMSE 60 min |
-|---|---|---|---|---|---|
-| Persistence (no AI) | 0.31 °C | 0.48 | 0.61 | 0.71 | 10.0 % |
-| Linear regression | 0.19 °C | 0.25 | 0.30 | 0.34 | 7.0 % |
-| **Gradient boosting** | **0.17 °C** | **0.17** | **0.18** | **0.18** | **3.5 %** |
+| Option (example products) | Hardware alone | **With the AI** | Cooling | kWh/yr | THB/yr | tCO₂/yr | CAPEX (assumed) | Payback |
+|---|---|---|---|---|---|---|---|---|
+| UPS ESS mode (Eaton 93PM) | 1.98 % | **2.38 %** | 0.0 % | 27,384 | 109,537 | 12.0 | 0.03 M THB | **0.2 yr** |
+| PM variable-speed pumps (Grundfos TPE3) | 0.30 % | **0.70 %** | 2.6 % | 8,090 | 32,360 | 3.5 | 0.40 M | 12.4 yr |
+| EC fans in both CRAHs (ebm-papst RadiPac/RadiFit, or Liebert PCW) | 1.16 % | **1.56 %** | 5.8 % | 17,996 | 71,984 | 7.9 | 0.90 M | 12.5 yr |
+| All of the above | 8.91 % | **9.28 %** | 25.6 % | 106,811 | 427,246 | 46.7 | 7.58 M | 17.7 yr |
+| Cold-aisle containment (Vertiv SmartAisle or similar) | 0.46 % | **0.87 %** | 3.2 % | 10,051 | 40,203 | 4.4 | 0.75 M | 18.7 yr |
+| Oil-free magnetic-bearing chiller (Danfoss Turbocor compressors) | 3.46 % | **3.85 %** | 14.3 % | 44,320 | 177,279 | 19.4 | 5.50 M | 31 yr |
 
-This meets the proposal targets (MAE ≤ 1 °C at 15 minutes, NRMSE ≤ 10 %). Persistence is always late: it only notices the GPU batch after it has started.
-The ML model learned from history that the batch starts at 01:00 on weekdays, so it sees it coming.
+![upgrades](docs/upgrades.png)
 
-![forecast](docs/forecast-vs-actual.png)
+Facility energy saved; no option let a rack exceed 27 °C. CO₂ uses Thailand's grid factor 0.4371 tCO₂/MWh (TGO, 2022);
+electricity 4 THB/kWh. CAPEX values are **budget assumptions** for a 12-rack room (editable in the dashboard), not quotes.
+What it says: switch the UPS to ESS first (after a risk review); fix the hardware findings (filter, bearing) before buying
+anything; the chiller only pays back at end of life. With containment the AI sits at the **24 °C setpoint ceiling 88 % of
+the time**: the racks would allow warmer, so the site's setpoint policy becomes the limit. After any physical change the
+sensor-integrity model must be re-baselined (a contained room looks "forged" to the old physics model).
 
-### ④ How the MPC chooses
+Ask the agents with the task *Plan upgrades*: the Hardware Engineer runs S6 then S8, and G3 recomputes the plan from the
+stored study.
 
-Like a GPS: try every route for the next hour, drop the ones that overheat, take the cheapest, drive only the first
-15 minutes, then plan again with fresh data.
+## Dashboard
 
-```mermaid
-flowchart LR
-    N["Setpoint now"]:::step --> C["Each 15 min:<br/>−1, 0 or +1 °C"]:::step
-    C --> P["4 steps → 3⁴ =<br/>81 plans"]:::step
-    P --> F["Forecast every plan"]:::ai
-    F --> D{"peak + safety margin<br/>≤ 27 °C?"}:::guard
-    D -- no --> X["Rejected"]:::guard
-    D -- yes --> E["Cheapest safe plan<br/>(least kWh)"]:::ok
-    E --> A["Apply only<br/>its first step"]:::ok
-    classDef step fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
-    classDef ai fill:#e8f1fc,stroke:#2a78d6,color:#0b0b0b,stroke-width:2px
-    classDef guard fill:#fbeeee,stroke:#d03b3b,color:#0b0b0b
-    classDef ok fill:#e6f6ef,stroke:#1baf7a,color:#0b0b0b
-```
+A multipage app with a menu at the top. Every page opens with a short header (what the page answers, three plain-language
+points and a small illustration in the cover's style); diagrams and method notes sit in a collapsed **How it works**.
+The **moment** in the sidebar (any 15 minutes of the two test weeks, with *Jump to* shortcuts such as *GPU batch about to
+start* or *Hardware warnings*) drives every page, and each page computes only what it shows.
 
-Example at 00:30, just before the GPU batch: 18 of the 81 plans are safe, and the cheapest is 21 → 21 → 21 → 22 °C.
-It lowers the setpoint by 1 °C first to pre-cool for the 01:00 job.
-
-![mpc](docs/mpc-81-plans.png)
-
-### ⑥ Controllers compared (normal operation, 14 days)
-
-| | Fixed 20 °C | Rule-based (tuned) | **AI + MPC** |
-|---|---|---|---|
-| Cooling energy | 12,512 kWh | 12,144 kWh | **11,892 kWh** |
-| Facility energy (incl. the 0.2 kW AI server running 24/7) | 44,687 kWh | 44,319 kWh | **44,141 kWh** |
-| PUE | 1.489 | 1.477 | **1.471** |
-| Minutes with inlet > 27 °C | 0 | 0 | **0** |
-| Average setpoint | 20.0 °C | 21.4 °C | 22.4 °C |
-| Decision time per step | – | – | 24 ms (target < 10 s) |
-
-```mermaid
-xychart-beta
-    title "Cooling energy over 14 test days (kWh, lower is better)"
-    x-axis ["Fixed 20 °C", "Rule-based", "AI + MPC"]
-    y-axis "kWh" 11500 --> 12700
-    bar [12512, 12144, 11892]
-```
-
-The axis starts at 11,500 kWh to make the gap visible; most cooling energy is needed whatever the setpoint.
-
-**Summary:** the AI cuts cooling energy by **5.0 %** vs the fixed setpoint and **2.1 %** vs the tuned rule-based controller.
-Whole-building energy drops by 1.22 % / 0.40 % (about 57,000 / 18,500 THB per year at 4 THB/kWh), with no overheating at any point.
-
-![results](docs/results-day.png)
-
-> **An honest reading:** the proposal targeted ≥ 10 % cooling savings vs a tuned rule-based controller. In this simulated room the AI **falls short at 2.1 %** because:
-> (1) rack B6 is a hot spot and the hottest rack 100 % of the time, which caps how warm the room can run;
-> (2) inlets above 26 °C make the server fans speed up, so warmer is not always cheaper (the model knows this and stops);
-> (3) the setpoint is the only control knob.
-> Next steps: fix the airflow at B6 (blanking panels/containment) or add knobs such as chilled-water temperature and fan speed.
-
-### ⑤ Fault tests (minutes with inlet > 27 °C)
-
-The AI only *proposes*; four rules can override it before anything is sent (**R5** applies the Hardware Engineer's
-constraint in agent cases, **R6** withholds the AI when the data fails the integrity check; see the hardware and security layers above):
-
-```mermaid
-flowchart LR
-    P["MPC proposal"]:::ai --> R1{"R1 · sensor<br/>missing?"}:::guard
-    R1 -- yes --> FB["Fallback setpoint"]:::ok
-    R1 -- no --> R2{"R2 · conditions never<br/>seen in training?"}:::guard
-    R2 -- yes --> FB
-    R2 -- no --> R3{"R3 · rack already<br/>near 27 °C?"}:::guard
-    R3 -- yes --> CO["Cool 2 °C now"]:::ok
-    R3 -- no --> R4["R4 · max ±1 °C per step,<br/>stay within 16–24 °C"]:::guard
-    R4 --> SEND["Send command"]:::ok
-    classDef ai fill:#e8f1fc,stroke:#2a78d6,color:#0b0b0b,stroke-width:2px
-    classDef guard fill:#fbeeee,stroke:#d03b3b,color:#0b0b0b
-    classDef ok fill:#e6f6ef,stroke:#1baf7a,color:#0b0b0b
-```
-
-| Scenario | Fixed | Rule-based | AI + MPC | AI without safety filter |
-|---|---|---|---|---|
-| Normal | 0 | 0 | 0 | – |
-| **B5/B6 sensors go offline** during the GPU batch | 0 | 210 | **0** (28 fallback steps) | 240 |
-| **Room changed after training** (+20 % recirculation, chiller 10 % worse) | 1,980 | 150 | **60** | – |
-| **Unplanned load surge** (+45–50 % on the GPU racks) | 0 | 0 | 15 (peak 27.03 °C) | – |
-
-- The safety filter matters: without it, the AI trusts the remaining (cooler) sensors and lets the room overheat for 240 minutes.
-- When the room changes, feedback correction cuts overheating from 240 to 60 minutes, but short exceedances remain when the batch starts. That is a signal to retrain.
-- Nobody can forecast a job that has never happened before. The AI runs closer to the limit, so it is hit harder in the first 15 minutes; then R3 cools by 2 °C immediately.
-
-## How to run
-
-Requires Python 3.11+ (tested on 3.12). `requirements.txt` pins exact versions because the committed
-`artifacts/bundle.pkl` is only reused when scikit-learn matches; otherwise the first start retrains (1–3 minutes).
-
-```bash
-python3 -m venv .venv
-```
-
-```bash
-.venv/bin/pip install -r requirements.txt
-```
-
-```bash
-.venv/bin/python -m predictive_cooling
-```
-
-The last command opens the dashboard at http://localhost:8501 (if `artifacts/bundle.pkl` is missing or was built with
-another scikit-learn, it first trains and tests everything, about 1–3 minutes).
-To run only the pipeline and print the result tables:
-
-```bash
-.venv/bin/python -m predictive_cooling.pipeline
-```
-
-Ask the agents from the command line:
-
-```bash
-.venv/bin/python -m predictive_cooling.agents --at "2026-04-21 00:30"
-```
-
-```bash
-.venv/bin/python -m predictive_cooling.agents --at "2026-04-29 05:30"
-```
-
-```bash
-.venv/bin/python -m predictive_cooling.agents --at "2026-04-21 00:30" --equipment-fault CRAH-1
-```
-
-```bash
-.venv/bin/python -m predictive_cooling.agents --at "2026-04-21 02:00" --attack spoofing
-```
-
-Tests (90 tests including headless dashboard smoke tests, about 4.5 minutes):
-
-```bash
-.venv/bin/python -m pytest -q
-```
+| Menu | Page | What you see |
+|---|---|---|
+| | **Overview** | The cover, the headline numbers, the idea in 30 seconds, the 15-minute loop as six cards, the five agents and four guards, and links into every part |
+| | **Ask the agents** | Task (recommend / analyze / plan upgrades) and agent mode (offline / Gemini / Claude); *Simulate a problem* adds failed sensors, equipment trips or a cyber attack. The answer, a swimlane trace (G1 → Supervisor → G2 → agents → G3 → G4), the G3 checklist, the Security Analyst's and Hardware Engineer's reports, the signed recommendation, the forecast vs the chosen plan and (with Supabase) the case history |
+| Operations | **Live plant** | The plant drawing with live values (hover for each unit's model, protocol and points), the power and heat Sankey diagrams, the installed equipment and instruments with sources |
+| | **Equipment health** | Every device's health (with simulated trips), findings with limits and days to the next limit, 4-week trend panels of the hidden faults, rack power, the gateway's raw-register → decoded view |
+| | **Upgrade advisor** | Each upgrade tested in closed loop (hardware alone vs with the AI), editable CAPEX, payback ranking, maintenance first |
+| | **Security** | The closed-loop spoofing and replay attacks, the integrity model's accuracy, a prompt-screen playground, STRIDE and protocol posture |
+| How the AI decides | **1 · Sensors** | Floor map of the 12 racks, the whole day as charts, the sensor dictionary and CSV download (toggle to browse all 13 weeks) |
+| | **2 · Clean data** | The problems found in each sensor, raw vs cleaned, the train/validation/test split |
+| | **3 · Forecast** | Error by horizon, forecast vs actual, feature importance, and a what-if with your own setpoint plan |
+| | **4 · Plan (MPC)** | All 81 plans at the moment (energy vs peak temperature), which are safe, which was chosen, and the AI's whole day |
+| | **5 · Safety** | The six rules, how often each fired, and a zoom on each fault scenario |
+| | **6 · Results** | Energy, PUE, the proposal §8.4 style table and the three controllers on the same day |
 
 ## Deploy
 
@@ -464,30 +599,15 @@ flowchart LR
 
 **Supabase case history (optional)**
 
-1. Create a Supabase project and run `supabase/migrations/001_agent_cases.sql`, then `002_allow_claude_agent_mode.sql`, in its SQL editor.
+1. Create a Supabase project and run `supabase/migrations/001_agent_cases.sql`, then `002_allow_claude_agent_mode.sql` and
+   `003_allow_upgrade_task_and_new_statuses.sql`, in its SQL editor (003 lets *Plan upgrades* cases be saved).
 2. Put the project URL and the **server-side secret key** in the secrets. The key stays on the server (Streamlit code
    never runs in the browser); RLS is on and the public roles get no access to the table.
-3. Every *Run case* in the agents tab is saved; *Case history (Supabase)* at the bottom of the tab shows the latest 20.
+3. Every *Run case* on the *Ask the agents* page is saved; *Case history (Supabase)* at the bottom of that page shows the latest 20.
    If Supabase is down the case still runs and a toast says it was not saved.
 
 For local runs, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` (git-ignored) or export the same
 names as environment variables.
-
-## Dashboard
-
-Every tab starts with an **In short** box (the message in plain language) and, where it helps, a diagram of the step.
-
-0. **Ask the agents**: pick a moment, a task (recommend / analyze), optional failed sensors, equipment trips or a simulated cyber attack, and the agent mode. You see the answer, a swimlane trace of who did what (G1 → Supervisor → G2 → Data Analyst → Security Analyst → Hardware Engineer → Cooling Advisor → G3 → G4), the G3 checklist, the Security Analyst's and Hardware Engineer's reports, the signed recommendation, the forecast vs the chosen plan and (with Supabase) the case history.
-1. **Sensors**: floor map (heatmap of the 12 racks) for any day and time, the whole day as charts, a column dictionary and a CSV download.
-2. **Clean data**: the problems found in each sensor, raw vs cleaned, and the train/validation/test split.
-3. **Forecast**: error by horizon, forecast vs actual, feature importance, and **a what-if where you set a setpoint plan and see what the model predicts**.
-4. **MPC decision**: pick a time and see all 81 plans (energy vs peak temperature), which ones are safe and which one was chosen.
-5. **Safety**: the 4 rules, how often each one fired, and a zoomed chart of each fault.
-6. **Results**: energy, PUE, the proposal §8.4 style table, and the 3 controllers on the same day.
-7. **Hardware**: health of every device at any moment (with simulated trips), the findings with their limits and days to the next
-   limit, 4-week trend panels of the hidden faults, rack power from the PDUs, and the gateway's raw-register → decoded view of any device.
-8. **Security**: the attack surface, the closed-loop spoofing and replay attacks (true temperature, setpoint sent and the integrity
-   residual), the integrity model's accuracy, a live prompt-screen playground, the STRIDE threat model and the protocol posture.
 
 ## Limitations
 
@@ -497,10 +617,17 @@ Every tab starts with an **In short** box (the message in plain language) and, w
 - The security checks are tested against the simulated attacks in this repository, not a red team. Pattern-based prompt
   screening can be evaded by rephrasing; it is one layer, and the numbers stay safe because Python computes them and G3 re-checks them.
 
-## File layout
+## Documentation and file layout
+
+The component documents in [architecture/](architecture/README.md) describe each part in more depth than this README:
+agents and skills, guardrails and safety rules, data, hardware, security, upgrades, the dashboard, deployment and the known
+gaps. Every number in them comes from the same study (`artifacts/bundle.pkl`).
 
 ```
-app.py                       Streamlit dashboard
+app.py                       dashboard entry: page setup, top navigation, the sidebar moment picker
+app_pages/                   one file per page (overview, agents, live plant, equipment health, upgrades, security, steps 1-6)
+ui/                          shared dashboard code: common.py (data, charts, page header, moment), panels.py, art.py (SVG art)
+CoverPage.png                project cover, also the Overview page's hero image
 data/sensor_history.csv      mock dataset (committed, open it directly)
 data/equipment_telemetry.csv equipment historian: 22 devices, 69 points (committed)
 predictive_cooling/
@@ -510,7 +637,7 @@ predictive_cooling/
   preprocess.py              ② cleaning + data split
   forecast.py                ③ forecasting models
   mpc.py                     ④ 81-plan MPC
-  safety.py                  ⑤ safety filter
+  safety.py                  ⑤ safety filter (rules R1–R6)
   controllers.py             Fixed / Rule-based / AI controllers
   evaluate.py                closed-loop tests + fault scenarios
   pipeline.py                runs everything + saves artifacts/
@@ -527,23 +654,42 @@ predictive_cooling/
     gateway.py               sensor gateway: poll, decode, quality flags
     telemetry.py             builds the equipment historian (with injected hardware faults)
     diagnostics.py           limits, trends -> days to limit, N+1 capacity, cooling constraint
+    catalog.py               installed models, instruments and upgrade products (with sources)
+    flows.py                 electricity and heat balance at one moment (Sankey + plant drawing)
+    upgrades.py, advisor.py  upgrade options as plant changes, closed-loop study, payback ranking (S8)
   agents/                    agent layer (Supervisor, Data Analyst, Security Analyst, Hardware Engineer, Cooling Advisor)
-    engine.py                LangGraph graph, G1/G2/G3, S5 compose, run_case()
+    engine.py                LangGraph graph, guards G1–G4, S5 compose, run_case()
     tools.py                 the tools agents may call (window ends at the case time)
     llm_loops.py             parent/child function-calling loops shared by the live modes
     gemini.py, claude.py     Gemini and Claude Haiku providers
-    skills.py, skill_specs/  S1–S7 registry and instructions
+    skills.py, skill_specs/  S1–S8 registry and instructions
 tests/test_pipeline.py       tests for every step
 tests/test_hardware.py       gateway, historian, diagnostics, rule R5 and the Hardware Engineer
 tests/test_security.py       prompt screen, integrity model, replay, R6, signing, audit chain, attacks end to end
+tests/test_upgrades.py       catalog, flow balance, upgrade study and advisor, S8 in offline and scripted-Gemini cases
 tests/test_agents.py         agent, guardrail, scripted-Gemini and mock-server Claude tests
 tests/test_app.py            headless dashboard smoke tests (Streamlit AppTest)
-tests/test_storage.py        Supabase history (off without keys, failures never break a case)
-artifacts/bundle.pkl         trained models + test logs (committed for deployment)
-supabase/migrations/         SQL for the optional agent_cases table
+tests/test_storage.py        Supabase history (off without keys, failures never break a case, SQL accepts every task)
+artifacts/bundle.pkl         trained models, test logs, attack runs and the upgrade study (committed for deployment)
+supabase/migrations/         SQL for the optional agent_cases table (run 001, 002, 003 in order)
 .streamlit/                  theme (config.toml) + secrets template
-docs/                        README images
+docs/                        README figures (scripts/make_figures.py regenerates five of them)
+scripts/make_figures.py      draws docs/architecture.png, agents-trace, hardware-trends, attacks, upgrades
+architecture/                component documents (agents, guardrails, data, hardware, security, dashboard, deployment)
+requirements-dev.txt         figure and lint tools (matplotlib, pyflakes), not needed to run the app
 Midterm Project /            proposal report (PDF)
 ```
 
-Branches: `main` = the earlier SustainDC/FastAPI/Supabase agent prototype; `claude` = the pipeline-only redesign (no agents); `claude-new-version` = this version (agent architecture + sensor data, trained forecaster and MPC).
+Branches: `main` = the earlier SustainDC/FastAPI/Supabase agent prototype; `claude` = the pipeline-only redesign (no agents);
+`claude-new-version` = this version (five agents and four guards on sensor data, a trained forecaster and MPC, the hardware and
+security layers, the upgrade advisor and the multipage dashboard).
+
+## Sources
+
+Facts about named products are the vendors' own published figures (checked Nov 2026); the simulation does not use them
+directly. Upgrade effects are modelled conservatively against them and measured in closed loop.
+
+- Thailand grid emission factor 0.4371 tCO₂/MWh (2022): [TGO grid emission factor table](https://ghgreduction.tgo.or.th/en/download/download/13065/3377/32.html) · [TGO update, Nov 2025](https://www.nationthailand.com/news/policy/40059019)
+- Installed: [Eaton 93PM datasheet](https://www.eaton.com/content/dam/eaton/products/backup-power-ups-surge-it-power-distribution/backup-power-ups/eaton-93pm-ups/eaton-93pm-ups-30-250kva-datasheet-ps153029en.pdf) · [Raritan PX3 tech specs](https://review.raritan.com/products/power/power-distribution/rack-pdu/tech-specs) · [NetBotz AP9335TH (manual)](https://www.manualsdir.com/manuals/42152/apc-netbotz-nbrk0200.html?page=28) · [NetBotz sensor accuracy](https://community.se.com/t5/EcoStruxure-IT-forum/Netbotz-sensors-accuracy/td-p/208583) · [Setra Model 264](https://www.setra.com/products/pressure/model-264-low-differential-pressure-transducer) · [PowerLogic PM5560](https://www.se.com/au/en/product/METSEPM5560/power-meter-powerlogic-pm5560-2-ethernet-up-to-63th-harmonic-11mb-4di-2do-52-alarms) · [SITRANS F M MAG 5100 W](https://www.siemens.com/global/en/products/automation/process-instrumentation/flow-measurement/electromagnetic/sitrans-f-m-mag-5100-w-for-water-applications.html) · [ifm VKV021](https://www.ifm.com/us/en/product/VKV021)
+- Upgrades: [Vertiv SmartAisle](https://www.vertiv.com/en-us/products-catalog/facilities-enclosures-and-racks/integrated-solutions/smartaisle/) · [ebm-papst fan retrofit](https://www.ebmpapst.com/sg/en/ec-fan-solutions/fan-retrofit.html) · [Vertiv Liebert PCW](https://www.vertiv.com/en-us/products-catalog/thermal-management/room-cooling/vertiv-liebert--pcw-chilled-water-floor-mount-cooling-unit/) · [Danfoss Turbocor](https://danfoss.com/en/products/compressors/dcs/turbocor) · [Grundfos TPE3](https://product-selection.grundfos.com/products/tp-tpe/tpe3-i)
+- Limits used by the diagnostics: ISO 10816-1 vibration zones (class I machines), ASHRAE TC 9.9 thermal guidelines (inlet ≤ 27 °C; humidity ≤ 60 %RH recommended, ≤ 80 %RH allowable A1)

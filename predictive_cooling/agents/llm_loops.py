@@ -151,7 +151,8 @@ def run_loops(rt, provider, messages, workflow_mode):
         return loop("security_analyst", ["S7"], available, execute)
 
     def engineer():
-        state = {"read": False, "diagnosed": False}
+        state = {"read": False, "diagnosed": False, "upgrades": False}
+        upgrade_mode = rt.request.mode == "upgrade"
 
         def available():
             tools = {"read_equipment": ("Poll all 22 field devices through the sensor gateway (BACnet/IP, Modbus TCP, SNMP v3) "
@@ -159,7 +160,10 @@ def run_loops(rt, provider, messages, workflow_mode):
             if state["read"]:
                 tools["diagnose_equipment"] = ("Check limits, 7-day trends (days to the next limit) and N+1 CRAH capacity; "
                                                "returns the cooling constraint.", EmptyArgs)
-            if state["diagnosed"]:
+            if state["diagnosed"] and upgrade_mode:
+                tools["evaluate_upgrades"] = ("Maintenance first, then every hardware upgrade ranked by payback, measured in "
+                                              "closed loop on the upgraded plant.", EmptyArgs)
+            if state["diagnosed"] and (state["upgrades"] or not upgrade_mode):
                 tools["finish_equipment_check"] = ("Finish with a short note for the Supervisor.", FinishArgs)
             return tools
 
@@ -169,10 +173,11 @@ def run_loops(rt, provider, messages, workflow_mode):
                     progress["hardware_done"] = True
                     return finish_hardware(rt, args.note)
                 out = tool_impl(rt, name)
-                state["read" if name == "read_equipment" else "diagnosed"] = True
+                state[{"read_equipment": "read", "diagnose_equipment": "diagnosed", "evaluate_upgrades": "upgrades"}[name]] = True
                 return out
-            return rt.call(name, "hardware_engineer", "S6", work), name == "finish_equipment_check"
-        return loop("hardware_engineer", ["S6"], available, execute)
+            skill = "S8" if name == "evaluate_upgrades" else "S6"
+            return rt.call(name, "hardware_engineer", skill, work), name == "finish_equipment_check"
+        return loop("hardware_engineer", ["S6", "S8"] if upgrade_mode else ["S6"], available, execute)
 
     def advisor():
         state = {"mpc": False, "safety": False}

@@ -17,7 +17,7 @@ import pandas as pd
 from .. import config as C
 from ..controllers import live_state
 from ..forecast import Forecaster
-from ..hardware import telemetry
+from ..hardware import advisor, telemetry
 from ..hardware.diagnostics import EquipmentWindow, diagnose
 from ..hardware.registry import REGISTRY
 from ..mpc import MPC
@@ -40,6 +40,7 @@ class AgentContext:
     fallback_sp: float
     equipment: pd.DataFrame | None = None          # data/equipment_telemetry.csv (loaded or built when not given)
     integrity: IntegrityModel | None = None         # sensor-integrity model (trained on the training weeks if not given)
+    upgrades: dict | None = None                    # closed-loop hardware-upgrade study from the bundle (S8)
 
     def __post_init__(self):
         self.mpc = MPC(self.forecaster, self.margins)
@@ -53,7 +54,7 @@ class AgentContext:
     @classmethod
     def from_bundle(cls, bundle, equipment=None):
         return cls(bundle["raw"], bundle["forecaster"], list(bundle["margins"]), bundle["fixed_sp"], equipment,
-                   bundle.get("integrity"))
+                   bundle.get("integrity"), bundle.get("upgrades"))
 
 
 def default_context():
@@ -236,6 +237,13 @@ def read_equipment(win: EquipmentWindow):
 
 def diagnose_equipment(win: EquipmentWindow):
     return diagnose(win)
+
+
+def evaluate_upgrades(ctx: AgentContext, diagnosis: dict):
+    """S8: maintenance first, then every upgrade option ranked by payback (from the closed-loop upgrade study)."""
+    if ctx.upgrades is None:
+        raise LookupError("UPGRADE_STUDY_MISSING")
+    return advisor.plan(ctx.upgrades, diagnosis)
 
 
 # ---- S7 security ---------------------------------------------------------------------------

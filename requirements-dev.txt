@@ -1,0 +1,4 @@
+# Tools for developing the project; not needed to run the app or the tests.
+-r requirements.txt
+matplotlib==3.11.2      # scripts/make_figures.py (README figures in docs/)
+pyflakes==4.1.0         # lint: python -m pyflakes app.py app_pages ui predictive_cooling tests scripts
