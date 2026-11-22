@@ -23,6 +23,8 @@ class CaseRequest(StrictModel):
                                                                    "for the last 45 minutes before `at`.")
     equipment_fault: tuple[str, ...] = Field(default=(), description="Demo: these cooling devices trip (status 0) "
                                                                       "for the last 30 minutes before `at`.")
+    cyber_attack: Literal["none", "spoofing", "replay", "setpoint_tamper"] = Field(
+        default="none", description="Demo: a simulated attack on the building network before `at` (see security/attacks.py).")
 
     @field_validator("at")
     @classmethod
@@ -47,12 +49,13 @@ class CaseRequest(StrictModel):
 
 
 class Policy(StrictModel):
-    version: str = "predictive-cooling-v2"
+    version: str = "predictive-cooling-v3"
     inlet_limit_c: float = Field(default=C.INLET_LIMIT, ge=15, le=35)
     history_hours: float = Field(default=2.0, ge=1.5, le=6)
     equipment_history_days: float = Field(default=7.0, ge=1, le=14)   # hardware trends need days, not hours
-    tool_budget: int = Field(default=24, ge=0, le=100)
-    model_call_budget: int = Field(default=20, ge=0, le=40)
+    security_history_hours: float = Field(default=26.0, ge=2, le=72)  # replay check: the last day + the attack hour
+    tool_budget: int = Field(default=30, ge=0, le=100)
+    model_call_budget: int = Field(default=24, ge=0, le=40)
     deadline_seconds: float = Field(default=120, gt=0, le=600)
 
 
@@ -64,6 +67,7 @@ class Event(StrictModel):
     skill_id: str | None = None
     detail: str = ""
     elapsed_ms: float
+    hash: str = ""                # SHA-256 chain over the trace (security/audit.py)
 
 
 class Check(StrictModel):
@@ -72,7 +76,7 @@ class Check(StrictModel):
     detail: str = ""
 
 
-Status = Literal["completed", "insufficient_data", "failed", "budget_exceeded"]
+Status = Literal["completed", "insufficient_data", "security_alert", "failed", "budget_exceeded"]
 Decision = Literal["change", "no_change", "max_cooling", "fallback", "analysis_only", "unavailable"]
 
 
@@ -93,6 +97,8 @@ class CaseResult(BaseModel):
     explanation: str = ""
     agent_notes: dict[str, str] = Field(default_factory=dict)
     events: list[Event] = Field(default_factory=list)
+    security: dict = Field(default_factory=dict)       # G1 prompt screen, G4 output guard, audit-chain head
+    command: dict | None = None                        # HMAC-signed recommendation (G4); None when nothing is released
     tool_calls: int = 0
     model_calls: int = 0
     model_tokens: int = 0

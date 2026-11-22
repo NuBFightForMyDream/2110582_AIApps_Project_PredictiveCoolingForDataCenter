@@ -1,5 +1,5 @@
 # S4 — Evaluate Setpoint Plans
-Owner: cooling_advisor. Version: 0.4.0.
+Owner: cooling_advisor. Version: 0.5.0.
 
 Call `run_mpc`: it tries all 81 plans for the next hour (each 15-minute step: -1, 0 or +1 °C),
 rejects any plan whose forecast hottest inlet + safety margin exceeds 27 °C and ranks the rest by

@@ -24,7 +24,8 @@ def render(**preset):
 def test_app_renders_every_tab():
     at, metrics = render()
     assert [t.label.split(" ", 1)[1] for t in at.tabs] == ["Ask the agents", "1 · Sensors", "2 · Clean data", "3 · Forecast",
-                                                          "4 · MPC decision", "5 · Safety", "6 · Results", "Hardware"]
+                                                          "4 · MPC decision", "5 · Safety", "6 · Results", "Hardware",
+                                                          "Security"]
     assert metrics["Agents' answer"] == "Set 21 °C" and metrics["Status"] == "completed"
     assert metrics["Devices answering"] == "22 / 22"
 

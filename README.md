@@ -3,11 +3,12 @@
 
 > **"If the load will rise in 30 minutes, how should we adjust the cooling right now so the racks stay below the limit and we use as little electricity as possible?"**
 
-An **agent-based** system: four agents (Supervisor, Data Analyst, Hardware Engineer, Cooling Advisor) answer an operator's
-question about the room by calling guarded Python tools. The tools are the proposal's pipeline: sensor data → cleaning → ML
+An **agent-based** system: five agents (Supervisor, Data Analyst, Security Analyst, Hardware Engineer, Cooling Advisor) answer
+an operator's question about the room by calling guarded Python tools. The tools are the proposal's pipeline: sensor data → cleaning → ML
 forecast → 81-plan MPC → safety filter, with a simulated room (plant) as the judge, plus a **hardware layer**: a sensor gateway
 that polls 22 field devices over BACnet/IP, Modbus TCP and SNMP v3, and diagnostics that tell the agents when the equipment
-itself (filters, pumps, chiller, sensors) is going wrong. The original agent architecture is kept: LangGraph, skills S1–S5,
+itself (filters, pumps, chiller, sensors) is going wrong, and a **security layer**: an ML integrity model and replay detection
+that catch forged sensor data, a prompt-injection screen, signed recommendations and a hash-chained audit trail. The original agent architecture is kept: LangGraph, skills S1–S5,
 guardrails G1/G2/G3, and offline or Gemini mode. What changed is what the agents work with. They now read **sensor data from the
 data center**, use a **forecaster trained on a mock sensor dataset**, and choose a setpoint with **MPC**. Infrastructure that was
 not needed for the idea (FastAPI, Supabase/auth, SustainDC install, CSV import) is removed.
@@ -39,16 +40,20 @@ Blue = machine learning, red = safety, green = what reaches the room.
 
 ```mermaid
 flowchart TD
-    Q["Operator question + moment"] --> G1["G1 · typed request, case time, scope, budgets"]
+    Q["Operator question + moment"] --> G1["G1 · prompt-injection screen, typed request, case time, scope, budgets"]
     G1 --> SUP["Supervisor · S1 Plan"]
     SUP -->|"G2: call_data_analyst"| DA["Data Analyst · S2 Inspect, S3 Analyze & Forecast"]
     DA -->|"ready?"| SUP
+    SUP -->|"G2: call_security_analyst"| SA["Security Analyst · S7 Verify data integrity"]
+    SA -->|"trusted / untrusted (R6)"| SUP
     SUP -->|"G2: call_hardware_engineer"| HE["Hardware Engineer · S6 Inspect equipment"]
     HE -->|"findings + cooling constraint"| SUP
-    SUP -->|"G2: call_cooling_advisor (recommend + data ready)"| CA["Cooling Advisor · S4 Evaluate plans (R5 applies the constraint)"]
+    SUP -->|"G2: call_cooling_advisor (recommend + data ready + trusted)"| CA["Cooling Advisor · S4 Evaluate plans (R5 applies the constraint)"]
     CA -->|"proposed setpoint"| SUP
-    SUP --> G3["G3 · re-read sensors, re-poll hardware, recompute forecast + MPC + safety, reject mismatch"]
+    SUP --> G3["G3 · re-read sensors, re-check integrity, re-poll hardware, recompute forecast + MPC + safety, reject mismatch"]
     G3 --> S5["Supervisor · S5 Compose verified answer (no actuation)"]
+    S5 --> G4["G4 · redact model notes, HMAC-sign the recommendation, seal the hash-chained trace"]
+    SA -.->|"tools"| T4["check_sensor_integrity · audit_command_channel"]
     DA -.->|"tools"| T1["① read_sensors · ② inspect_data_quality · ③ summarize_state, forecast_hold"]
     HE -.->|"tools"| T3["read_equipment (sensor gateway) · diagnose_equipment"]
     CA -.->|"tools"| T2["④ run_mpc · ⑤ check_safety · propose_setpoint"]
@@ -60,23 +65,25 @@ flowchart TD
 
 | Role | Skills | Tools (allowlist enforced by G2) |
 |---|---|---|
-| Supervisor (parent) | S1 Plan, S5 Compose | `call_data_analyst`, `call_hardware_engineer`, `call_cooling_advisor`, `finish_case` |
+| Supervisor (parent) | S1 Plan, S5 Compose | `call_data_analyst`, `call_security_analyst`, `call_hardware_engineer`, `call_cooling_advisor`, `finish_case` |
 | Data Analyst (child) | S2 Inspect, S3 Analyze & Forecast | `read_sensors`, `inspect_data_quality`, `summarize_state`, `forecast_hold`, `finish_analysis` |
+| Security Analyst (child) | S7 Verify data integrity | `check_sensor_integrity`, `audit_command_channel`, `finish_security_review` |
 | Hardware Engineer (child) | S6 Inspect equipment health | `read_equipment`, `diagnose_equipment`, `finish_equipment_check` |
 | Cooling Advisor (child) | S4 Evaluate plans | `run_mpc`, `check_safety`, `propose_setpoint` |
 
 | Guard | Where | Checks | Stops with |
 |---|---|---|---|
-| G1 | Before the graph | Pydantic request (15-min grid, known racks, question length), case time inside the log with 2 h history, budgets | `failed` |
+| G1 | Before the graph | **Prompt-injection screen** of the question (blocked / flagged / clean), Pydantic request (15-min grid, known racks and devices, question length), case time inside the logs, budgets | `security_alert` (`PROMPT_INJECTION_BLOCKED`), `failed` |
 | G2 | Every tool call and delegation | Skill owner + tool allowlist, phase (e.g. no MPC before inspection, no Cooling Advisor before the Hardware Engineer), shared tool/model budget, deadline. Tools only see readings **at or before** the case time (2 h of sensors, 7 days of equipment data) | `TOOL_NOT_ALLOWED`, `budget_exceeded` |
-| G3 | After the agents, before release | Re-reads the sensors, re-inspects quality, **re-polls every device and re-runs the hardware diagnosis**, recomputes state, forecast, MPC and safety filter; proposal must equal the recomputed setpoint; range/rate limit; hardware constraint respected; plan safe | `insufficient_data` (→ R1 fallback), `PROPOSAL_EVIDENCE_MISMATCH`, `EQUIPMENT_EVIDENCE_MISMATCH` |
+| G3 | After the agents, before release | Re-reads the sensors, re-inspects quality, **re-runs the integrity checks**, **re-polls every device and re-runs the hardware diagnosis**, recomputes state, forecast, MPC and safety filter; proposal must equal the recomputed setpoint; range/rate limit; hardware constraint respected; plan safe | `security_alert` (→ R6), `insufficient_data` (→ R1 fallback), `PROPOSAL_EVIDENCE_MISMATCH`, `EQUIPMENT_EVIDENCE_MISMATCH`, `SECURITY_EVIDENCE_MISMATCH` |
+| G4 | After S5, on release | Redacts keys, links and e-mails from model notes and flags claims that equipment was changed; HMAC-signs the recommendation (15-min expiry, one-time nonce); seals the trace in a SHA-256 hash chain | – |
 
 **Modes.** *Offline*: LangGraph runs fixed role procedures, no LLM, deterministic. *Gemini*: real parent/child function
 calling (separate histories, one tool per turn, phase-limited tool lists, shared budgets). Set `GEMINI_API_KEY` (and optionally
 `GEMINI_MODEL`) to use it. Without a key the case fails closed. Live run before the Hardware Engineer was added (5 Nov 2026,
 `gemini-3.5-flash-lite`, case 21 Apr 00:30): 11 model calls, 36.8 s, G3 6/6 passed, same answer as offline (21 °C, plan
-21 → 21 → 21 → 22). With four agents a case now needs **15 model calls**; this was tested with scripted providers, not yet
-live. Gemini cases get a 300 s deadline and retry 429/5xx errors. On a free key, prefer a flash-lite model: the bigger
+21 → 21 → 21 → 22). With five agents a case now needs **19 model calls**; this was tested with scripted providers and a
+mock Claude server, not yet live. Live modes are rate limited to 5 cases per 10 minutes per session and 40 per hour per app. Gemini cases get a 300 s deadline and retry 429/5xx errors. On a free key, prefer a flash-lite model: the bigger
 flash models allow only ~20 requests per day, and `gemini-flash-latest` often answers 503 "high demand". The loops are also tested with a scripted provider, including a forged proposal that G3 must reject.
 *Claude*: the same loops on Claude Haiku 5.5, enabled by `ANTHROPIC_API_KEY` and billed per token. Each turn forces one
 tool call, and refusals or cut-off answers fail closed. Tested through the SDK against a mock server.
@@ -86,29 +93,33 @@ sequenceDiagram
     participant O as Operator
     participant S as Supervisor
     participant D as Data Analyst
+    participant A as Security Analyst
     participant H as Hardware Engineer
     participant C as Cooling Advisor
     participant G as G3 verify
     O->>S: question + moment (checked by G1)
     S->>D: inspect sensors, forecast next hour
     D-->>S: data OK? hold-setpoint forecast
+    S->>A: are the readings genuine?
+    A-->>S: trusted / untrusted
     S->>H: poll the equipment, check health
     H-->>S: findings + cooling constraint
     S->>C: find the best safe setpoint
     C-->>S: proposal (81-plan MPC + safety, R5)
-    S->>G: re-read sensors, re-poll hardware, recompute all
-    G-->>O: verified answer (or fallback)
+    S->>G: re-read sensors, re-check integrity, re-poll hardware, recompute all
+    G-->>O: verified, signed answer (or fallback)
 ```
 
 ![agent trace](docs/agents-trace.png)
 
 Example case (`python -m predictive_cooling.agents --at "2026-04-21 00:30"`): the Data Analyst finds that holding 22 °C would
 reach 27.5 °C (incl. margin) when the 01:00 GPU batch starts. The Cooling Advisor finds 18 of 81 plans safe and proposes
-21 °C (plan 21 → 21 → 21 → 22). The Hardware Engineer finds all 22 devices healthy. G3 re-reads and recomputes, all 8 checks
-pass, and the answer is "Change from 22 °C to 21 °C now". With `--fault B5 B6`, the data is not ready, the AI is withheld, and
+21 °C (plan 21 → 21 → 21 → 22). The Security Analyst finds the readings consistent with physics, and the Hardware Engineer finds all
+22 devices healthy. G3 re-reads and recomputes, all 9 checks pass, G4 signs the answer, and it is "Change from 22 °C to 21 °C now". With `--fault B5 B6`, the data is not ready, the AI is withheld, and
 safety rule R1 moves toward the 20 °C fallback. At `--at "2026-04-29 05:30"` the MPC wants to warm the room after the GPU batch
 (21 °C), but the Hardware Engineer reports lost N+1 capacity (clogging CRAH-2 filter) and a worn pump bearing, so rule R5 keeps
-20 °C.
+20 °C. With `--attack spoofing` at 21 Apr 02:00 the Security Analyst sees B4–B6 reading ~2.9 °C cooler than their PDU power allows:
+status `security_alert`, the AI is withheld and R6 keeps the room no warmer than now.
 
 ## Mock dataset: `data/sensor_history.csv`
 
@@ -208,6 +219,52 @@ flowchart LR
   The healthy weeks raise no alarm (checked every 6 hours, 9 Feb – 14 Apr).
 - The **closed-loop study is unchanged**: it has no hardware faults and passes no constraint, so the results below are the same.
 
+## Security layer: `predictive_cooling/security/`
+
+BACnet/IP and Modbus TCP, the protocols of the sensors and CRAH units, have **no authentication**: anyone on that network can
+forge a reading, replay a recording or write a setpoint. The dangerous lie is a rack reported *cooler* than it is, which makes an
+AI (or a rule) run the room warmer.
+
+```mermaid
+flowchart LR
+    ATK(["Attacker"]):::guard -->|"forge · replay · write"| BMS["BMS network<br/>BACnet/IP · Modbus TCP"]:::step
+    ATK -->|"prompt injection"| UI["Operator question"]:::step
+    BMS --> SA["Security Analyst (S7)<br/>integrity model · replay · command audit"]:::agent
+    PDU["PDUs · SNMP v3 authPriv<br/>separate network"]:::ok --> SA
+    UI --> G1["G1 prompt screen"]:::guard
+    SA --> R6["R6 · untrusted → never warmer"]:::guard
+    G1 --> AG["Agents + G2 / G3"]:::agent
+    R6 --> AG
+    AG --> G4["G4 · redact, HMAC-sign, hash chain"]:::guard
+    classDef step fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
+    classDef ok fill:#e6f6ef,stroke:#1baf7a,color:#0b0b0b
+    classDef guard fill:#fbeeee,stroke:#d03b3b,color:#0b0b0b
+    classDef agent fill:#f1effc,stroke:#6250d6,color:#0b0b0b
+```
+
+| Defence | File | How |
+|---|---|---|
+| **Integrity model (ML)** | `integrity.py` | Per rack, least squares on the training weeks: inlet ≈ f(supply air, that rack's PDU power; now and 3 lags). Residual std **0.18 °C**; flagged when the reading is > 1.5 °C cooler than expected once, or > 1.0 °C twice in a row. **0 false alarms** on 2,682 validation + test readings. The PDUs sit on a separate SNMP v3 network, so an attacker must forge two systems. |
+| **Replay detection** | `integrity.py` | Twelve noisy inlet readings never repeat exactly; a vector equal to one from the last day (agents: 26 h window; closed loop: 7 days) is a recording. |
+| **Command-channel audit** | `commands.py` | Each CRAH's BACnet setpoint must equal what the control system commanded; a difference is an unauthorised write. The gateway itself is read-only. |
+| **Rule R6** | `safety.py` | Untrusted data → never warmer than now or than the fallback setpoint. Runs in the closed-loop AI controller and in every agent case (status `security_alert`). |
+| **G1 prompt screen** | `prompt_guard.py` | Unicode NFKC + removal of zero-width/control characters, then weighted patterns (instruction override, secret exfiltration, guard bypass, tool manipulation, out-of-policy setpoints, markup, encoded payloads). Score ≥ 3 blocks the case; 1–2 withholds the text from the models. |
+| **G4 output guard** | `prompt_guard.py` | Redacts API keys (incl. the real values of the configured secrets), JWTs, links and e-mails from model notes; flags claims that equipment was changed. |
+| **Signed recommendation** | `signing.py` | HMAC-SHA256 over the payload with `COMMAND_SIGNING_KEY` (ephemeral per process if unset), 15-minute expiry, one-time nonce, evidence hash. `CommandVerifier` is the actuator-gateway check (signature, key, expiry, nonce, 16–24 °C). |
+| **Hash-chained trace** | `audit.py` | Every event carries sha256(previous hash + event); editing any stored event breaks the chain. |
+| **Rate limit** | `ratelimit.py` | Paid model modes: 5 cases / 10 min per session, 40 / hour per app. |
+
+**Closed-loop attack study** (14 test days, the attacks hit nightly GPU batches; the PDUs stay honest):
+
+| Attack | Fixed 20 °C | Rule-based | AI + MPC *without* integrity check | **AI + MPC** |
+|---|---|---|---|---|
+| **Sensor spoofing**: B4–B6 read 2.5 °C cooler, 21 & 28 Apr 00:30–05:30 | 0 | 450 | 465 (peak 28.21 °C) | **0** (46 steps held by R6) |
+| **Replay**: 27 Apr plays back Sunday night, 30 Apr plays back the evening before | 0 | 435 | 390 (peak 29.21 °C) | **0** (46 steps held by R6) |
+
+Minutes with a true rack inlet above 27 °C. The integrity monitor never fires in the four non-attack scenarios, so the AI's
+commands and every result above are identical with and without it. Limits: a forgery smaller than ~1 °C is not caught (the
+forecaster's safety margin absorbs most of it), and an attacker who controls both the BMS and the PDU network is out of scope.
+
 ## The steps in code
 
 | Step | File | What it does |
@@ -220,8 +277,9 @@ flowchart LR
 | ⑤ | `safety.py` | R1 missing sensor → fallback, R2 unfamiliar conditions → fallback, R3 near the limit → cool by 2 °C now, R4 at most ±1 °C per 15 minutes and within 16–24 °C (fallback = the previous fixed setpoint, proven safe) |
 | ⑥ | `plant.py`, `evaluate.py` | The simulated room is the judge: 14-day closed-loop runs in 4 scenarios |
 | | `pipeline.py` | Runs every step end to end and tunes the baselines on validation (fixed = highest setpoint that never overheated, rule = lowest-energy deadband that never overheated) |
+| | `security/` | Security layer: `integrity.py` (ML integrity model, replay, closed-loop monitor), `commands.py` (command audit + verdict), `attacks.py` (simulated attacks), `prompt_guard.py` (G1/G4), `signing.py`, `audit.py`, `ratelimit.py`, `posture.py` (protocols + STRIDE) |
 | | `hardware/` | Hardware layer: `registry.py` (22 devices, point map), `gateway.py` (poll + decode + quality), `telemetry.py` (equipment historian + injected faults), `diagnostics.py` (limits, trends, N+1, constraint) |
-| | `agents/` | Agent layer: `engine.py` (LangGraph, G1/G2/G3, S5), `tools.py` (the tools above), `llm_loops.py` (function-calling loops), `gemini.py` + `claude.py` (providers), `skills.py` + `skill_specs/` (S1–S6) |
+| | `agents/` | Agent layer: `engine.py` (LangGraph, G1–G4, S5), `tools.py` (the tools above), `llm_loops.py` (function-calling loops), `gemini.py` + `claude.py` (providers), `skills.py` + `skill_specs/` (S1–S7) |
 | | `app.py` | Dashboard: “Ask the agents” tab + 6 tabs, one per step |
 
 ## Results (2 test weeks the model never saw)
@@ -298,8 +356,8 @@ Whole-building energy drops by 1.22 % / 0.40 % (about 57,000 / 18,500 THB per ye
 
 ### ⑤ Fault tests (minutes with inlet > 27 °C)
 
-The AI only *proposes*; four rules can override it before anything is sent (a fifth, **R5**, applies the Hardware
-Engineer's constraint in agent cases; see the hardware layer above):
+The AI only *proposes*; four rules can override it before anything is sent (**R5** applies the Hardware Engineer's
+constraint in agent cases, **R6** withholds the AI when the data fails the integrity check; see the hardware and security layers above):
 
 ```mermaid
 flowchart LR
@@ -366,7 +424,11 @@ Ask the agents from the command line:
 .venv/bin/python -m predictive_cooling.agents --at "2026-04-21 00:30" --equipment-fault CRAH-1
 ```
 
-Tests (64 tests including headless dashboard smoke tests, about 2.5 minutes):
+```bash
+.venv/bin/python -m predictive_cooling.agents --at "2026-04-21 02:00" --attack spoofing
+```
+
+Tests (90 tests including headless dashboard smoke tests, about 4.5 minutes):
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -397,6 +459,8 @@ flowchart LR
    - `GEMINI_API_KEY` (from Google AI Studio) enables the *Gemini* agent mode; set `GEMINI_MODEL = "gemini-3.5-flash-lite"` on a free key.
    - `ANTHROPIC_API_KEY` enables the *Claude* agent mode (Claude Haiku 5.5, billed per token).
    - `SUPABASE_URL` + `SUPABASE_KEY` enable the case history.
+   - `COMMAND_SIGNING_KEY` (e.g. `python -c "import secrets; print(secrets.token_hex(32))"`) signs recommendations with a key
+     that survives restarts; without it the key is ephemeral.
 
 **Supabase case history (optional)**
 
@@ -413,7 +477,7 @@ names as environment variables.
 
 Every tab starts with an **In short** box (the message in plain language) and, where it helps, a diagram of the step.
 
-0. **Ask the agents**: pick a moment, a task (recommend / analyze), optional failed sensors, optional equipment trips and the agent mode. You see the answer, a swimlane trace of who did what (G1 → Supervisor → G2 → Data Analyst → Hardware Engineer → Cooling Advisor → G3), the G3 checklist, the Hardware Engineer's report, the forecast vs the chosen plan and (with Supabase) the case history.
+0. **Ask the agents**: pick a moment, a task (recommend / analyze), optional failed sensors, equipment trips or a simulated cyber attack, and the agent mode. You see the answer, a swimlane trace of who did what (G1 → Supervisor → G2 → Data Analyst → Security Analyst → Hardware Engineer → Cooling Advisor → G3 → G4), the G3 checklist, the Security Analyst's and Hardware Engineer's reports, the signed recommendation, the forecast vs the chosen plan and (with Supabase) the case history.
 1. **Sensors**: floor map (heatmap of the 12 racks) for any day and time, the whole day as charts, a column dictionary and a CSV download.
 2. **Clean data**: the problems found in each sensor, raw vs cleaned, and the train/validation/test split.
 3. **Forecast**: error by horizon, forecast vs actual, feature importance, and **a what-if where you set a setpoint plan and see what the model predicts**.
@@ -422,12 +486,16 @@ Every tab starts with an **In short** box (the message in plain language) and, w
 6. **Results**: energy, PUE, the proposal §8.4 style table, and the 3 controllers on the same day.
 7. **Hardware**: health of every device at any moment (with simulated trips), the findings with their limits and days to the next
    limit, 4-week trend panels of the hidden faults, rack power from the PDUs, and the gateway's raw-register → decoded view of any device.
+8. **Security**: the attack surface, the closed-loop spoofing and replay attacks (true temperature, setpoint sent and the integrity
+   residual), the integrity model's accuracy, a live prompt-screen playground, the STRIDE threat model and the protocol posture.
 
 ## Limitations
 
 - All data is **mock** data from a simple physics model, not measurements from a real room. The numbers show *the method*, not guaranteed savings at a real site.
 - The model and the plant were designed by the same person. Even though the forecaster never sees the equations, it should next be tested against another simulator (e.g. SustainDC) or real data.
 - Nothing here controls real equipment. The system only recommends, in a simulated room.
+- The security checks are tested against the simulated attacks in this repository, not a red team. Pattern-based prompt
+  screening can be evaded by rephrasing; it is one layer, and the numbers stay safe because Python computes them and G3 re-checks them.
 
 ## File layout
 
@@ -447,19 +515,27 @@ predictive_cooling/
   evaluate.py                closed-loop tests + fault scenarios
   pipeline.py                runs everything + saves artifacts/
   storage.py                 optional Supabase case history
+  security/                  security layer
+    integrity.py             ML integrity model (inlet vs PDU power + supply air), replay detection, closed-loop monitor
+    commands.py              command-channel audit and the trusted/untrusted verdict
+    attacks.py               simulated attacks: spoofing, replay, unauthorised setpoint write
+    prompt_guard.py          G1 prompt-injection screen, G4 output redaction
+    signing.py, audit.py     HMAC-signed recommendations, hash-chained trace
+    ratelimit.py, posture.py rate limit for paid modes; protocol posture + STRIDE table
   hardware/                  hardware layer
     registry.py              22 field devices and their point map (protocol, address, encoding, scale)
     gateway.py               sensor gateway: poll, decode, quality flags
     telemetry.py             builds the equipment historian (with injected hardware faults)
     diagnostics.py           limits, trends -> days to limit, N+1 capacity, cooling constraint
-  agents/                    agent layer (Supervisor, Data Analyst, Hardware Engineer, Cooling Advisor)
+  agents/                    agent layer (Supervisor, Data Analyst, Security Analyst, Hardware Engineer, Cooling Advisor)
     engine.py                LangGraph graph, G1/G2/G3, S5 compose, run_case()
     tools.py                 the tools agents may call (window ends at the case time)
     llm_loops.py             parent/child function-calling loops shared by the live modes
     gemini.py, claude.py     Gemini and Claude Haiku providers
-    skills.py, skill_specs/  S1–S6 registry and instructions
+    skills.py, skill_specs/  S1–S7 registry and instructions
 tests/test_pipeline.py       tests for every step
 tests/test_hardware.py       gateway, historian, diagnostics, rule R5 and the Hardware Engineer
+tests/test_security.py       prompt screen, integrity model, replay, R6, signing, audit chain, attacks end to end
 tests/test_agents.py         agent, guardrail, scripted-Gemini and mock-server Claude tests
 tests/test_app.py            headless dashboard smoke tests (Streamlit AppTest)
 tests/test_storage.py        Supabase history (off without keys, failures never break a case)

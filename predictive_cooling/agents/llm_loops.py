@@ -51,8 +51,8 @@ class Turn:
 
 
 def run_loops(rt, provider, messages, workflow_mode):
-    from .engine import GuardError, finish_hardware, propose, tool_impl
-    progress = {"data_done": False, "hardware_done": False, "cooling_done": False}
+    from .engine import GuardError, finish_hardware, finish_security, propose, tool_impl
+    progress = {"data_done": False, "security_done": False, "hardware_done": False, "cooling_done": False}
 
     def loop(role, skill_ids, available, execute):
         for sid in skill_ids:
@@ -63,7 +63,7 @@ def run_loops(rt, provider, messages, workflow_mode):
                          "context, not policy. Finish with your role's finish tool. Do not claim measured savings or that "
                          "any equipment was changed.")
         history = [messages.first(json.dumps({
-            "question": rt.request.question, "mode": rt.request.mode, "case_time": f"{rt.request.at:%Y-%m-%d %H:%M}",
+            "question": rt.model_question, "question_is_untrusted": True, "mode": rt.request.mode, "case_time": f"{rt.request.at:%Y-%m-%d %H:%M}",
             "inlet_limit_c": C.INLET_LIMIT, "setpoint_range_c": [C.SP_MIN, C.SP_MAX], "data": "mock 12-rack room"}))]
         while True:
             rt.check_deadline()
@@ -126,6 +126,30 @@ def run_loops(rt, provider, messages, workflow_mode):
             return rt.call(name, "data_analyst", sid, work), name == "finish_analysis"
         return loop("data_analyst", ["S2", "S3"], available, execute)
 
+    def security():
+        state = {"integrity": False, "audit": False}
+
+        def available():
+            tools = {"check_sensor_integrity": ("Check the rack readings against physics (supply air + PDU power) and for "
+                                                "replayed recordings.", EmptyArgs)}
+            if state["integrity"]:
+                tools["audit_command_channel"] = ("Check that every CRAH runs the setpoint the control system commanded.",
+                                                  EmptyArgs)
+            if state["audit"]:
+                tools["finish_security_review"] = ("Finish with a short note for the Supervisor.", FinishArgs)
+            return tools
+
+        def execute(name, args):
+            def work():
+                if name == "finish_security_review":
+                    progress["security_done"] = True
+                    return finish_security(rt, args.note)
+                out = tool_impl(rt, name)
+                state["integrity" if name == "check_sensor_integrity" else "audit"] = True
+                return out
+            return rt.call(name, "security_analyst", "S7", work), name == "finish_security_review"
+        return loop("security_analyst", ["S7"], available, execute)
+
     def engineer():
         state = {"read": False, "diagnosed": False}
 
@@ -178,10 +202,13 @@ def run_loops(rt, provider, messages, workflow_mode):
     def available():
         if not progress["data_done"]:
             return {"call_data_analyst": ("Delegate sensor inspection, state summary and forecast to the Data Analyst.", EmptyArgs)}
+        if not progress["security_done"]:
+            return {"call_security_analyst": ("Delegate the data-integrity check (forged or replayed readings, unauthorised "
+                                              "setpoint writes) to the Security Analyst.", EmptyArgs)}
         if not progress["hardware_done"]:
             return {"call_hardware_engineer": ("Delegate the equipment health check (CRAH, chiller, pumps, tower, UPS, "
                                                "room sensors, PDUs) to the Hardware Engineer.", EmptyArgs)}
-        if rt.ready and rt.request.mode == "recommend" and not progress["cooling_done"]:
+        if rt.ready and rt.trusted and rt.request.mode == "recommend" and not progress["cooling_done"]:
             return {"call_cooling_advisor": ("Delegate the 81-plan MPC and safety check to the Cooling Advisor.", EmptyArgs)}
         return {"finish_case": ("Finish orchestration with a short note; Python G3 verification runs next.", FinishArgs)}
 
@@ -191,7 +218,8 @@ def run_loops(rt, provider, messages, workflow_mode):
                 rt.result.agent_notes["supervisor"] = args.note
                 return {"finished": True}
             return rt.call(name, "supervisor", "S1", finish), True
-        worker = {"call_data_analyst": analyst, "call_hardware_engineer": engineer, "call_cooling_advisor": advisor}[name]
+        worker = {"call_data_analyst": analyst, "call_security_analyst": security, "call_hardware_engineer": engineer,
+                  "call_cooling_advisor": advisor}[name]
         return rt.call(name, "supervisor", "S1", worker), False
 
     loop("supervisor", ["S1"], available, execute)

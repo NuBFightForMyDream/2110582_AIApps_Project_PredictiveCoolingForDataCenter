@@ -4,6 +4,8 @@ The MPC only *proposes*. Before a setpoint is sent, these rules are checked in o
 
 R1 Missing data   any rack sensor is missing -> ignore the AI, use the fallback setpoint
 R2 Unfamiliar     sensors far outside the training data -> ignore the AI, use the fallback setpoint
+R6 Untrusted      the sensor data failed the integrity check (forged or replayed readings, unauthorised
+                  setpoint write) -> never warmer than now or than the fallback setpoint
 R5 Hardware       the Hardware Engineer's constraint: "no_raise" -> never warmer than now,
                   "fallback" -> never warmer than now or than the fallback setpoint (a colder AI
                   proposal is kept). Agent cases only; the closed-loop study passes no constraint.
@@ -23,6 +25,7 @@ RULES = {
     "R3_too_hot_now": "Measured inlet near limit → cool by 2 °C now",
     "R4_rate_or_range_limit": "Change limited to ±1 °C per step / 16-24 °C",
     "R5_equipment_constraint": "Hardware fault → never warmer than now (and than fallback if a unit failed)",
+    "R6_untrusted_data": "Sensor data failed the integrity check → never warmer than now, toward fallback",
 }
 EQUIPMENT_CONSTRAINTS = ("none", "no_raise", "fallback")
 
@@ -33,8 +36,10 @@ class SafetyFilter:
         self.limit = limit
         self.emergency_margin = emergency_margin
 
-    def check(self, proposed_sp, current_sp, reading, unfamiliar=(), equipment="none"):
-        """Return (setpoint to send, list of rule ids that fired). `equipment` is the hardware constraint (R5)."""
+    def check(self, proposed_sp, current_sp, reading, unfamiliar=(), equipment="none", trusted=True):
+        """Return (setpoint to send, list of rule ids that fired).
+
+        `equipment` is the Hardware Engineer's constraint (R5); `trusted` is the integrity verdict (R6)."""
         if equipment not in EQUIPMENT_CONSTRAINTS:
             raise ValueError(f"unknown equipment constraint {equipment!r}")
         fired = []
@@ -46,6 +51,9 @@ class SafetyFilter:
         elif unfamiliar:
             fired.append("R2_unfamiliar_conditions")
             target = self.fallback_sp
+        if not trusted:                              # forged data could hide a hot room: never warm it up
+            fired.append("R6_untrusted_data")
+            target = min(target, self.fallback_sp, current_sp)
         if equipment == "fallback":                  # cooling hardware failed: never warm the room up
             fired.append("R5_equipment_constraint")
             target = min(target, self.fallback_sp, current_sp)
