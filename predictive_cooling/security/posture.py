@@ -1,4 +1,4 @@
-"""Static security posture of the room's protocols and the STRIDE threat model (shown in the Security tab)."""
+"""Static security posture of the room's protocols and the STRIDE threat model (shown on the Security page)."""
 from ..hardware.registry import DEVICES
 
 PROTOCOLS = {

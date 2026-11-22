@@ -106,7 +106,7 @@ def signed(x, digits=1):
 def get_bundle():
     bundle = pipeline.load(rebuild_if_stale=False)
     if bundle is None:
-        with st.status("First run: generating data, training models and running the plant tests (2–4 min)…",
+        with st.status("First run: generating data, training models and running the plant tests (2–5 min)…",
                        expanded=True) as status:
             bundle = pipeline.build(workers=4 if sys.platform == "linux" else 1, log=st.write)
             status.update(label="Ready", state="complete")

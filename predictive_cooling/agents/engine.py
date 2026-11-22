@@ -1,4 +1,4 @@
-"""LangGraph orchestration of the three agents, the G2 tool gateway and G3 independent verification.
+"""LangGraph orchestration of the five agents, the G1-G4 guards and G3 independent verification.
 
     G1 request + prompt screen  ->  Supervisor (S1)  ->  Data Analyst (S2, S3)  ->  Security Analyst (S7)
         ->  Hardware Engineer (S6)  ->  Cooling Advisor (S4)  ->  G3 re-read + recompute

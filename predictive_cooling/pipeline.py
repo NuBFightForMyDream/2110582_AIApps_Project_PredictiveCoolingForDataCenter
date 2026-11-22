@@ -1,6 +1,6 @@
 """Run the whole study end to end and save what the dashboard shows.
 
-    python -m predictive_cooling.pipeline          # about 1-3 minutes
+    python -m predictive_cooling.pipeline          # about 2-5 minutes
 
 1 sensors -> 2 clean -> 3 train + score forecasters -> tune baselines on validation weeks
 -> 4/5 run Fixed, Rule-based and AI + MPC (+ safety) on the plant (6) in four test scenarios

@@ -62,7 +62,7 @@ if pick == "normal":
                f"{r['cooling_pct']:.1f} %. Why: (1) rack B6 is a hot spot that caps how warm the room can run; (2) above 26 °C "
                "inlet the server fans speed up, so warmer is not always cheaper — the model knows this and stops; "
                "(3) the setpoint is the only knob. Fixing the B6 airflow or adding knobs (chilled-water temperature, fan "
-               "speed) are the next levers.")
+               "speed) are the next levers: the Upgrade advisor page measures them.")
 d = moment().date()                            # the day picked in the sidebar
 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.09,
                     subplot_titles=("Setpoint (°C)", "True hottest inlet (°C)"))

@@ -99,7 +99,7 @@ def trace_chart(result):
 
 @st.fragment
 def agent_case_panel():
-    """Controls, run and results of one case. A fragment: Run case reruns only this part, not every tab."""
+    """Controls, run and results of one case. A fragment: Run case reruns only this part, not the whole page."""
     at = moment()
     c1, c2 = st.columns([1.25, 1], vertical_alignment="bottom")
     mode = c1.segmented_control("Task", ["recommend", "analyze", "upgrade"], default="recommend",

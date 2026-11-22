@@ -58,3 +58,17 @@ def test_save_inserts_and_failures_are_reported_not_raised():
     assert storage.save_case(*_case(), client=client) is None
     assert client.rows[0]["case_id"] == "c1"
     assert "offline" in storage.save_case(*_case(), client=FakeClient(fail=True))
+
+
+def test_migrations_accept_every_task_and_agent_mode_the_code_can_save():
+    """The SQL check constraints (latest migration wins) must allow every value CaseRequest allows."""
+    import re
+    import typing
+    from pathlib import Path
+    allowed = {}
+    for sql in sorted((Path(__file__).resolve().parent.parent / "supabase" / "migrations").glob("*.sql")):
+        for column, values in re.findall(r"check \((\w+) in \(([^)]*)\)\)", sql.read_text()):
+            allowed[column] = set(re.findall(r"'([^']+)'", values))
+    fields = CaseRequest.model_fields
+    assert set(typing.get_args(fields["mode"].annotation)) <= allowed["task"]
+    assert set(typing.get_args(fields["agent_mode"].annotation)) <= allowed["agent_mode"]
