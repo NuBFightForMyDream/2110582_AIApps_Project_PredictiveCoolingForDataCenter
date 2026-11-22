@@ -9,7 +9,7 @@ forecast → 81-plan MPC → safety filter, with a simulated room (plant) as the
 that polls 22 field devices over BACnet/IP, Modbus TCP and SNMP v3, and diagnostics that tell the agents when the equipment
 itself (filters, pumps, chiller, sensors) is going wrong, and a **security layer**: an ML integrity model and replay detection
 that catch forged sensor data, a prompt-injection screen, signed recommendations and a hash-chained audit trail. The
-**Data center** view draws the whole site (air, chilled water, condenser water, electricity) with the installed model of
+**Live plant** page draws the whole site (air, chilled water, condenser water, electricity) with the installed model of
 every device and sensor, and an **upgrade advisor** measures each hardware option in closed loop together with the AI. The original agent architecture is kept: LangGraph, skills S1–S5,
 guardrails G1/G2/G3, and offline or Gemini mode. What changed is what the agents work with. They now read **sensor data from the
 data center**, use a **forecaster trained on a mock sensor dataset**, and choose a setpoint with **MPC**. Infrastructure that was
@@ -269,7 +269,7 @@ forecaster's safety margin absorbs most of it), and an attacker who controls bot
 
 ## Equipment, flows and upgrades (physical + AI)
 
-**What is installed** (`hardware/catalog.py`, shown in the *Data center* tab with links). Named products are real product
+**What is installed** (`hardware/catalog.py`, shown on the *Live plant* page with links). Named products are real product
 families with the vendor-published facts used here (checked Nov 2026); legacy units without a verified model are described
 by class. The plant model's own numbers (capacity, COP, fan power) are this project's, not datasheet values.
 
@@ -285,7 +285,7 @@ by class. The plant model's own numbers (capacity, COP, fan power) are this proj
 | Chilled-water flow | Siemens SITRANS F M MAG 5100 W + MAG 5000 | ±0.4 % of rate |
 | Pump vibration | ifm VKV021 | 0–25 mm/s RMS, 4–20 mA, to DIN ISO 10816 |
 
-**Flows** (`hardware/flows.py`): at any moment, the *Data center* tab draws the plant (roof, plant room, data hall,
+**Flows** (`hardware/flows.py`): at any moment, the *Live plant* page draws the plant (roof, plant room, data hall,
 electrical room) with live values and model names on hover, plus two Sankey diagrams: where the electricity goes (grid →
 UPS → rack groups, chiller, CRAH fans, pumps + tower, lighting) and where the heat goes (servers + fans + walls → chilled
 water → chiller → condenser water → cooling tower → outdoor air). Both balance exactly.
@@ -330,7 +330,7 @@ stored study.
 | | `security/` | Security layer: `integrity.py` (ML integrity model, replay, closed-loop monitor), `commands.py` (command audit + verdict), `attacks.py` (simulated attacks), `prompt_guard.py` (G1/G4), `signing.py`, `audit.py`, `ratelimit.py`, `posture.py` (protocols + STRIDE) |
 | | `hardware/` | Hardware layer: `registry.py` (22 devices, point map), `gateway.py` (poll + decode + quality), `telemetry.py` (equipment historian + injected faults), `diagnostics.py` (limits, trends, N+1, constraint), `catalog.py` (installed models, instruments, upgrade products + sources), `flows.py` (power/heat balance), `upgrades.py` + `advisor.py` (closed-loop upgrade study, payback ranking) |
 | | `agents/` | Agent layer: `engine.py` (LangGraph, G1–G4, S5), `tools.py` (the tools above), `llm_loops.py` (function-calling loops), `gemini.py` + `claude.py` (providers), `skills.py` + `skill_specs/` (S1–S7) |
-| | `app.py` | Dashboard: “Ask the agents” tab + 6 tabs, one per step |
+| | `app.py`, `app_pages/`, `ui/` | Dashboard: the entry point (navigation, sidebar moment), one file per page, shared helpers and illustrations |
 
 ## Results (2 test weeks the model never saw)
 
@@ -482,7 +482,7 @@ Ask the agents from the command line:
 .venv/bin/python -m predictive_cooling.agents --at "2026-04-29 05:30" --mode upgrade
 ```
 
-Tests (102 tests including headless dashboard smoke tests, about 5.5 minutes):
+Tests (116 tests including headless smoke tests of every dashboard page, about 7 minutes):
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -521,7 +521,7 @@ flowchart LR
 1. Create a Supabase project and run `supabase/migrations/001_agent_cases.sql`, then `002_allow_claude_agent_mode.sql`, in its SQL editor.
 2. Put the project URL and the **server-side secret key** in the secrets. The key stays on the server (Streamlit code
    never runs in the browser); RLS is on and the public roles get no access to the table.
-3. Every *Run case* in the agents tab is saved; *Case history (Supabase)* at the bottom of the tab shows the latest 20.
+3. Every *Run case* on the *Ask the agents* page is saved; *Case history (Supabase)* at the bottom of that page shows the latest 20.
    If Supabase is down the case still runs and a toast says it was not saved.
 
 For local runs, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` (git-ignored) or export the same
@@ -529,22 +529,25 @@ names as environment variables.
 
 ## Dashboard
 
-Every tab starts with an **In short** box (the message in plain language) and, where it helps, a diagram of the step.
+A multipage app with a menu at the top. Every page opens with a short header (what the page answers, three plain-language
+points and a small illustration in the cover's style); diagrams and method notes sit in a collapsed **How it works**.
+The **moment** in the sidebar (any 15 minutes of the two test weeks, with *Jump to* shortcuts such as *GPU batch about to
+start* or *Hardware warnings*) drives every page, and each page computes only what it shows.
 
-0. **Ask the agents**: pick a moment, a task (recommend / analyze / plan upgrades), optional failed sensors, equipment trips or a simulated cyber attack, and the agent mode. You see the answer, a swimlane trace of who did what (G1 → Supervisor → G2 → Data Analyst → Security Analyst → Hardware Engineer → Cooling Advisor → G3 → G4), the G3 checklist, the Security Analyst's and Hardware Engineer's reports, the signed recommendation, the forecast vs the chosen plan and (with Supabase) the case history.
-1. **Sensors**: floor map (heatmap of the 12 racks) for any day and time, the whole day as charts, a column dictionary and a CSV download.
-2. **Clean data**: the problems found in each sensor, raw vs cleaned, and the train/validation/test split.
-3. **Forecast**: error by horizon, forecast vs actual, feature importance, and **a what-if where you set a setpoint plan and see what the model predicts**.
-4. **MPC decision**: pick a time and see all 81 plans (energy vs peak temperature), which ones are safe and which one was chosen.
-5. **Safety**: the 4 rules, how often each one fired, and a zoomed chart of each fault.
-6. **Results**: energy, PUE, the proposal §8.4 style table, and the 3 controllers on the same day.
-7. **Hardware**: health of every device at any moment (with simulated trips), the findings with their limits and days to the next
-   limit, 4-week trend panels of the hidden faults, rack power from the PDUs, and the gateway's raw-register → decoded view of any device.
-8. **Security**: the attack surface, the closed-loop spoofing and replay attacks (true temperature, setpoint sent and the integrity
-   residual), the integrity model's accuracy, a live prompt-screen playground, the STRIDE threat model and the protocol posture.
-9. **Data center**: the plant drawing with live values (hover for each unit's model, protocol and points), the power and heat
-   Sankey diagrams, the installed equipment and instruments with sources, and the upgrade advisor (editable CAPEX, hardware
-   alone vs with the AI, maintenance first).
+| Menu | Page | What you see |
+|---|---|---|
+| | **Overview** | The cover, the headline numbers, the idea in 30 seconds, the 15-minute loop as six cards, the five agents and four guards, and links into every part |
+| | **Ask the agents** | Task (recommend / analyze / plan upgrades) and agent mode (offline / Gemini / Claude); *Simulate a problem* adds failed sensors, equipment trips or a cyber attack. The answer, a swimlane trace (G1 → Supervisor → G2 → agents → G3 → G4), the G3 checklist, the Security Analyst's and Hardware Engineer's reports, the signed recommendation, the forecast vs the chosen plan and (with Supabase) the case history |
+| Operations | **Live plant** | The plant drawing with live values (hover for each unit's model, protocol and points), the power and heat Sankey diagrams, the installed equipment and instruments with sources |
+| | **Equipment health** | Every device's health (with simulated trips), findings with limits and days to the next limit, 4-week trend panels of the hidden faults, rack power, the gateway's raw-register → decoded view |
+| | **Upgrade advisor** | Each upgrade tested in closed loop (hardware alone vs with the AI), editable CAPEX, payback ranking, maintenance first |
+| | **Security** | The closed-loop spoofing and replay attacks, the integrity model's accuracy, a prompt-screen playground, STRIDE and protocol posture |
+| How the AI decides | **1 · Sensors** | Floor map of the 12 racks, the whole day as charts, the sensor dictionary and CSV download (toggle to browse all 13 weeks) |
+| | **2 · Clean data** | The problems found in each sensor, raw vs cleaned, the train/validation/test split |
+| | **3 · Forecast** | Error by horizon, forecast vs actual, feature importance, and a what-if with your own setpoint plan |
+| | **4 · Plan (MPC)** | All 81 plans at the moment (energy vs peak temperature), which are safe, which was chosen, and the AI's whole day |
+| | **5 · Safety** | The six rules, how often each fired, and a zoom on each fault scenario |
+| | **6 · Results** | Energy, PUE, the proposal §8.4 style table and the three controllers on the same day |
 
 ## Limitations
 
@@ -557,7 +560,10 @@ Every tab starts with an **In short** box (the message in plain language) and, w
 ## File layout
 
 ```
-app.py                       Streamlit dashboard
+app.py                       dashboard entry: page setup, top navigation, the sidebar moment picker
+app_pages/                   one file per page (overview, agents, live plant, equipment health, upgrades, security, steps 1-6)
+ui/                          shared dashboard code: common.py (data, charts, page header, moment), panels.py, art.py (SVG art)
+CoverPage.png                project cover, also the Overview page's hero image
 data/sensor_history.csv      mock dataset (committed, open it directly)
 data/equipment_telemetry.csv equipment historian: 22 devices, 69 points (committed)
 predictive_cooling/
