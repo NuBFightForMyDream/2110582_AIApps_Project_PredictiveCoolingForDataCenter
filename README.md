@@ -3,9 +3,11 @@
 
 > **"If the load will rise in 30 minutes, how should we adjust the cooling right now so the racks stay below the limit and we use as little electricity as possible?"**
 
-An **agent-based** system: three agents (Supervisor, Data Analyst, Cooling Advisor) answer an operator's question about the
-room by calling guarded Python tools. The tools are the proposal's pipeline: sensor data → cleaning → ML forecast → 81-plan MPC →
-safety filter, with a simulated room (plant) as the judge. The original agent architecture is kept: LangGraph, skills S1–S5,
+An **agent-based** system: four agents (Supervisor, Data Analyst, Hardware Engineer, Cooling Advisor) answer an operator's
+question about the room by calling guarded Python tools. The tools are the proposal's pipeline: sensor data → cleaning → ML
+forecast → 81-plan MPC → safety filter, with a simulated room (plant) as the judge, plus a **hardware layer**: a sensor gateway
+that polls 22 field devices over BACnet/IP, Modbus TCP and SNMP v3, and diagnostics that tell the agents when the equipment
+itself (filters, pumps, chiller, sensors) is going wrong. The original agent architecture is kept: LangGraph, skills S1–S5,
 guardrails G1/G2/G3, and offline or Gemini mode. What changed is what the agents work with. They now read **sensor data from the
 data center**, use a **forecaster trained on a mock sensor dataset**, and choose a setpoint with **MPC**. Infrastructure that was
 not needed for the idea (FastAPI, Supabase/auth, SustainDC install, CSV import) is removed.
@@ -41,11 +43,14 @@ flowchart TD
     G1 --> SUP["Supervisor · S1 Plan"]
     SUP -->|"G2: call_data_analyst"| DA["Data Analyst · S2 Inspect, S3 Analyze & Forecast"]
     DA -->|"ready?"| SUP
-    SUP -->|"G2: call_cooling_advisor (recommend + data ready)"| CA["Cooling Advisor · S4 Evaluate plans"]
+    SUP -->|"G2: call_hardware_engineer"| HE["Hardware Engineer · S6 Inspect equipment"]
+    HE -->|"findings + cooling constraint"| SUP
+    SUP -->|"G2: call_cooling_advisor (recommend + data ready)"| CA["Cooling Advisor · S4 Evaluate plans (R5 applies the constraint)"]
     CA -->|"proposed setpoint"| SUP
-    SUP --> G3["G3 · re-read sensors, recompute forecast + MPC + safety, reject mismatch"]
+    SUP --> G3["G3 · re-read sensors, re-poll hardware, recompute forecast + MPC + safety, reject mismatch"]
     G3 --> S5["Supervisor · S5 Compose verified answer (no actuation)"]
     DA -.->|"tools"| T1["① read_sensors · ② inspect_data_quality · ③ summarize_state, forecast_hold"]
+    HE -.->|"tools"| T3["read_equipment (sensor gateway) · diagnose_equipment"]
     CA -.->|"tools"| T2["④ run_mpc · ⑤ check_safety · propose_setpoint"]
 ```
 
@@ -55,23 +60,24 @@ flowchart TD
 
 | Role | Skills | Tools (allowlist enforced by G2) |
 |---|---|---|
-| Supervisor (parent) | S1 Plan, S5 Compose | `call_data_analyst`, `call_cooling_advisor`, `finish_case` |
+| Supervisor (parent) | S1 Plan, S5 Compose | `call_data_analyst`, `call_hardware_engineer`, `call_cooling_advisor`, `finish_case` |
 | Data Analyst (child) | S2 Inspect, S3 Analyze & Forecast | `read_sensors`, `inspect_data_quality`, `summarize_state`, `forecast_hold`, `finish_analysis` |
+| Hardware Engineer (child) | S6 Inspect equipment health | `read_equipment`, `diagnose_equipment`, `finish_equipment_check` |
 | Cooling Advisor (child) | S4 Evaluate plans | `run_mpc`, `check_safety`, `propose_setpoint` |
 
 | Guard | Where | Checks | Stops with |
 |---|---|---|---|
 | G1 | Before the graph | Pydantic request (15-min grid, known racks, question length), case time inside the log with 2 h history, budgets | `failed` |
-| G2 | Every tool call and delegation | Skill owner + tool allowlist, phase (e.g. no MPC before inspection), shared tool/model budget, deadline. Tools only see readings **at or before** the case time | `TOOL_NOT_ALLOWED`, `budget_exceeded` |
-| G3 | After the agents, before release | Re-reads the sensors, re-inspects quality, recomputes state, forecast, MPC and safety filter; proposal must equal the recomputed setpoint; range/rate limit; plan safe | `insufficient_data` (→ R1 fallback), `PROPOSAL_EVIDENCE_MISMATCH` |
+| G2 | Every tool call and delegation | Skill owner + tool allowlist, phase (e.g. no MPC before inspection, no Cooling Advisor before the Hardware Engineer), shared tool/model budget, deadline. Tools only see readings **at or before** the case time (2 h of sensors, 7 days of equipment data) | `TOOL_NOT_ALLOWED`, `budget_exceeded` |
+| G3 | After the agents, before release | Re-reads the sensors, re-inspects quality, **re-polls every device and re-runs the hardware diagnosis**, recomputes state, forecast, MPC and safety filter; proposal must equal the recomputed setpoint; range/rate limit; hardware constraint respected; plan safe | `insufficient_data` (→ R1 fallback), `PROPOSAL_EVIDENCE_MISMATCH`, `EQUIPMENT_EVIDENCE_MISMATCH` |
 
 **Modes.** *Offline*: LangGraph runs fixed role procedures, no LLM, deterministic. *Gemini*: real parent/child function
 calling (separate histories, one tool per turn, phase-limited tool lists, shared budgets). Set `GEMINI_API_KEY` (and optionally
-`GEMINI_MODEL`) to use it. Without a key the case fails closed. Live run (5 Nov 2026, `gemini-3.5-flash-lite`, case
-21 Apr 00:30): 11 model calls, 36.8 s, G3 6/6 passed, same answer as offline (21 °C, plan 21 → 21 → 21 → 22). Gemini
-cases get a 300 s deadline and retry 429/5xx errors. On a free key, prefer a flash-lite model: one case needs ~11
-requests, the bigger flash models allow only ~20 requests per day, and `gemini-flash-latest` often answers 503
-"high demand". The loops are also tested with a scripted provider, including a forged proposal that G3 must reject.
+`GEMINI_MODEL`) to use it. Without a key the case fails closed. Live run before the Hardware Engineer was added (5 Nov 2026,
+`gemini-3.5-flash-lite`, case 21 Apr 00:30): 11 model calls, 36.8 s, G3 6/6 passed, same answer as offline (21 °C, plan
+21 → 21 → 21 → 22). With four agents a case now needs **15 model calls**; this was tested with scripted providers, not yet
+live. Gemini cases get a 300 s deadline and retry 429/5xx errors. On a free key, prefer a flash-lite model: the bigger
+flash models allow only ~20 requests per day, and `gemini-flash-latest` often answers 503 "high demand". The loops are also tested with a scripted provider, including a forged proposal that G3 must reject.
 *Claude*: the same loops on Claude Haiku 5.5, enabled by `ANTHROPIC_API_KEY` and billed per token. Each turn forces one
 tool call, and refusals or cut-off answers fail closed. Tested through the SDK against a mock server.
 
@@ -80,14 +86,17 @@ sequenceDiagram
     participant O as Operator
     participant S as Supervisor
     participant D as Data Analyst
+    participant H as Hardware Engineer
     participant C as Cooling Advisor
     participant G as G3 verify
     O->>S: question + moment (checked by G1)
     S->>D: inspect sensors, forecast next hour
     D-->>S: data OK? hold-setpoint forecast
+    S->>H: poll the equipment, check health
+    H-->>S: findings + cooling constraint
     S->>C: find the best safe setpoint
-    C-->>S: proposal (81-plan MPC + safety)
-    S->>G: re-read sensors, recompute all
+    C-->>S: proposal (81-plan MPC + safety, R5)
+    S->>G: re-read sensors, re-poll hardware, recompute all
     G-->>O: verified answer (or fallback)
 ```
 
@@ -95,8 +104,11 @@ sequenceDiagram
 
 Example case (`python -m predictive_cooling.agents --at "2026-04-21 00:30"`): the Data Analyst finds that holding 22 °C would
 reach 27.5 °C (incl. margin) when the 01:00 GPU batch starts. The Cooling Advisor finds 18 of 81 plans safe and proposes
-21 °C (plan 21 → 21 → 21 → 22). G3 re-reads and recomputes, all 6 checks pass, and the answer is "Change from 22 °C to 21 °C now". With
-`--fault B5 B6`, the data is not ready, the AI is withheld, and safety rule R1 moves toward the 20 °C fallback.
+21 °C (plan 21 → 21 → 21 → 22). The Hardware Engineer finds all 22 devices healthy. G3 re-reads and recomputes, all 8 checks
+pass, and the answer is "Change from 22 °C to 21 °C now". With `--fault B5 B6`, the data is not ready, the AI is withheld, and
+safety rule R1 moves toward the 20 °C fallback. At `--at "2026-04-29 05:30"` the MPC wants to warm the room after the GPU batch
+(21 °C), but the Hardware Engineer reports lost N+1 capacity (clogging CRAH-2 filter) and a worn pump bearing, so rule R5 keeps
+20 °C.
 
 ## Mock dataset: `data/sensor_history.csv`
 
@@ -142,6 +154,60 @@ flowchart LR
     classDef ok fill:#e6f6ef,stroke:#1baf7a,color:#0b0b0b
 ```
 
+## Hardware layer: `predictive_cooling/hardware/`
+
+The room log above is what a BMS summary shows. The **equipment historian** `data/equipment_telemetry.csv` is what the
+devices themselves report: **69 points from 22 devices** every 15 minutes (8,736 rows), derived from the same plant run
+(same seeds, so temperatures and power agree with the room log). Rebuild it with `python -m predictive_cooling.hardware`.
+
+| Device | Protocol | Points (examples) |
+|---|---|---|
+| CRAH-1, CRAH-2 | BACnet/IP (REAL values) | status, setpoint, supply/return air, return RH, fan speed/kW, airflow, filter ΔP, chilled-water valve |
+| CH-1 chiller | Modbus TCP (16-bit registers × scale) | load, kW, COP, chilled-water supply/return, condenser in/out, condenser approach |
+| CHWP-1 (duty), CHWP-2 (standby) | Modbus TCP via the drive | status, speed, flow, kW, vibration (mm/s RMS), bearing temperature |
+| CT-1 cooling tower | Modbus TCP | fan speed, kW, wet bulb, cold-water temperature, approach |
+| UPS-1 | SNMP v3, RFC 1628 UPS-MIB | output source, load %, output kW, battery temperature, efficiency |
+| ENV-CA-1/2, ENV-DP-1 | Modbus TCP | cold-aisle temperature + RH (row A / row B side), containment over-pressure |
+| PDU-A1 … PDU-B6 | SNMP v3 | power per rack |
+
+```mermaid
+flowchart LR
+    D["22 field devices"]:::step --> P["BACnet/IP · Modbus TCP · SNMP v3"]:::step
+    P --> GW["Sensor gateway<br/>raw → engineering units<br/>+ quality flag"]:::guard
+    GW --> DX["Diagnostics<br/>limits · 7-day trends · N+1"]:::ai
+    DX --> HE["Hardware Engineer (S6)"]:::agent
+    HE --> SUP["Supervisor"]:::agent
+    HE -.->|"cooling constraint"| R5["Safety rule R5"]:::guard
+    classDef step fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
+    classDef ai fill:#e8f1fc,stroke:#2a78d6,color:#0b0b0b,stroke-width:2px
+    classDef guard fill:#fbeeee,stroke:#d03b3b,color:#0b0b0b
+    classDef agent fill:#f1effc,stroke:#6250d6,color:#0b0b0b
+```
+
+- **Sensor gateway** (`gateway.py`): encodes each value the way its protocol carries it (BACnet REAL, Modbus int16/uint16 × scale,
+  SNMP integers), then decodes it with the point map (`registry.py`) and flags `out_of_range` (impossible value or saturated
+  register), `no_data` and `comm_loss` (device did not answer). A real site swaps the simulated backend for a BACnet/Modbus/SNMP
+  client with the same `read()` method.
+- **Diagnostics** (`diagnostics.py`): limits with their sources (ISO 10816-1 vibration zones, ASHRAE TC 9.9 humidity, filter final
+  ΔP, condenser approach, containment pressure), a straight-line trend through the daily means → **days until the next limit**,
+  and an **N+1** check (can one CRAH alone carry the week's peak IT load?). A humidity sensor is cross-checked against the dew
+  point from the CRAH return air, so a drifting sensor is reported as a sensor fault, not as humid room air.
+- **Cooling constraint** → **safety rule R5**: a cooling-path warning (`no_raise`) means *never warmer than now*; a failure with no
+  backup (`fallback`), e.g. a tripped CRAH, means *never warmer than now or than the fallback setpoint*. A critical pump with a
+  healthy standby is `no_raise` (switch pumps). Advisory findings (UPS, humidity, sensor drift) do not constrain cooling.
+- **Faults hidden in the test weeks** (they show in the equipment data days before any rack gets hot). First appearance, checked hourly:
+
+  | Fault (starts) | Watch | Warning | Critical |
+  |---|---|---|---|
+  | CRAH-2 filter loading (15 Apr) | 21 Apr (projected 250 Pa within 7 days) | 27 Apr 19:00 · N+1 lost 27 Apr 18:00 | – |
+  | CHWP-1 bearing wear (24 Apr) | 25 Apr | 27 Apr 15:00 (ISO zone C) | 2 May 09:00 (zone D) |
+  | ENV-CA-2 humidity drift (22 Apr) | 25 Apr | 28 Apr 04:00 | – |
+  | CH-1 condenser fouling (23 Apr) | 25 Apr | 30 Apr 01:00 | – |
+  | CT-1 comm loss (26 Apr 14:00–16:00) | – | 26 Apr 14:00 | – |
+
+  The healthy weeks raise no alarm (checked every 6 hours, 9 Feb – 14 Apr).
+- The **closed-loop study is unchanged**: it has no hardware faults and passes no constraint, so the results below are the same.
+
 ## The steps in code
 
 | Step | File | What it does |
@@ -154,7 +220,8 @@ flowchart LR
 | ⑤ | `safety.py` | R1 missing sensor → fallback, R2 unfamiliar conditions → fallback, R3 near the limit → cool by 2 °C now, R4 at most ±1 °C per 15 minutes and within 16–24 °C (fallback = the previous fixed setpoint, proven safe) |
 | ⑥ | `plant.py`, `evaluate.py` | The simulated room is the judge: 14-day closed-loop runs in 4 scenarios |
 | | `pipeline.py` | Runs every step end to end and tunes the baselines on validation (fixed = highest setpoint that never overheated, rule = lowest-energy deadband that never overheated) |
-| | `agents/` | Agent layer: `engine.py` (LangGraph, G1/G2/G3, S5), `tools.py` (the tools above), `llm_loops.py` (function-calling loops), `gemini.py` + `claude.py` (providers), `skills.py` + `skill_specs/` (S1–S5) |
+| | `hardware/` | Hardware layer: `registry.py` (22 devices, point map), `gateway.py` (poll + decode + quality), `telemetry.py` (equipment historian + injected faults), `diagnostics.py` (limits, trends, N+1, constraint) |
+| | `agents/` | Agent layer: `engine.py` (LangGraph, G1/G2/G3, S5), `tools.py` (the tools above), `llm_loops.py` (function-calling loops), `gemini.py` + `claude.py` (providers), `skills.py` + `skill_specs/` (S1–S6) |
 | | `app.py` | Dashboard: “Ask the agents” tab + 6 tabs, one per step |
 
 ## Results (2 test weeks the model never saw)
@@ -231,7 +298,8 @@ Whole-building energy drops by 1.22 % / 0.40 % (about 57,000 / 18,500 THB per ye
 
 ### ⑤ Fault tests (minutes with inlet > 27 °C)
 
-The AI only *proposes*; four rules can override it before anything is sent:
+The AI only *proposes*; four rules can override it before anything is sent (a fifth, **R5**, applies the Hardware
+Engineer's constraint in agent cases; see the hardware layer above):
 
 ```mermaid
 flowchart LR
@@ -290,7 +358,15 @@ Ask the agents from the command line:
 .venv/bin/python -m predictive_cooling.agents --at "2026-04-21 00:30"
 ```
 
-Tests (30 tests, about 40 seconds):
+```bash
+.venv/bin/python -m predictive_cooling.agents --at "2026-04-29 05:30"
+```
+
+```bash
+.venv/bin/python -m predictive_cooling.agents --at "2026-04-21 00:30" --equipment-fault CRAH-1
+```
+
+Tests (64 tests including headless dashboard smoke tests, about 2.5 minutes):
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -337,13 +413,15 @@ names as environment variables.
 
 Every tab starts with an **In short** box (the message in plain language) and, where it helps, a diagram of the step.
 
-0. **Ask the agents**: pick a moment, a task (recommend / analyze), optional failed sensors and the agent mode. You see the answer, a swimlane trace of who did what (G1 → Supervisor → G2 → Data Analyst → Cooling Advisor → G3), the G3 checklist, the forecast vs the chosen plan and (with Supabase) the case history.
+0. **Ask the agents**: pick a moment, a task (recommend / analyze), optional failed sensors, optional equipment trips and the agent mode. You see the answer, a swimlane trace of who did what (G1 → Supervisor → G2 → Data Analyst → Hardware Engineer → Cooling Advisor → G3), the G3 checklist, the Hardware Engineer's report, the forecast vs the chosen plan and (with Supabase) the case history.
 1. **Sensors**: floor map (heatmap of the 12 racks) for any day and time, the whole day as charts, a column dictionary and a CSV download.
 2. **Clean data**: the problems found in each sensor, raw vs cleaned, and the train/validation/test split.
 3. **Forecast**: error by horizon, forecast vs actual, feature importance, and **a what-if where you set a setpoint plan and see what the model predicts**.
 4. **MPC decision**: pick a time and see all 81 plans (energy vs peak temperature), which ones are safe and which one was chosen.
 5. **Safety**: the 4 rules, how often each one fired, and a zoomed chart of each fault.
 6. **Results**: energy, PUE, the proposal §8.4 style table, and the 3 controllers on the same day.
+7. **Hardware**: health of every device at any moment (with simulated trips), the findings with their limits and days to the next
+   limit, 4-week trend panels of the hidden faults, rack power from the PDUs, and the gateway's raw-register → decoded view of any device.
 
 ## Limitations
 
@@ -356,6 +434,7 @@ Every tab starts with an **In short** box (the message in plain language) and, w
 ```
 app.py                       Streamlit dashboard
 data/sensor_history.csv      mock dataset (committed, open it directly)
+data/equipment_telemetry.csv equipment historian: 22 devices, 69 points (committed)
 predictive_cooling/
   config.py                  all constants (limit, horizon, split dates, electricity price)
   plant.py                   ⑥ simulated room (the judge)
@@ -368,14 +447,21 @@ predictive_cooling/
   evaluate.py                closed-loop tests + fault scenarios
   pipeline.py                runs everything + saves artifacts/
   storage.py                 optional Supabase case history
-  agents/                    agent layer (Supervisor, Data Analyst, Cooling Advisor)
+  hardware/                  hardware layer
+    registry.py              22 field devices and their point map (protocol, address, encoding, scale)
+    gateway.py               sensor gateway: poll, decode, quality flags
+    telemetry.py             builds the equipment historian (with injected hardware faults)
+    diagnostics.py           limits, trends -> days to limit, N+1 capacity, cooling constraint
+  agents/                    agent layer (Supervisor, Data Analyst, Hardware Engineer, Cooling Advisor)
     engine.py                LangGraph graph, G1/G2/G3, S5 compose, run_case()
     tools.py                 the tools agents may call (window ends at the case time)
     llm_loops.py             parent/child function-calling loops shared by the live modes
     gemini.py, claude.py     Gemini and Claude Haiku providers
-    skills.py, skill_specs/  S1–S5 registry and instructions
+    skills.py, skill_specs/  S1–S6 registry and instructions
 tests/test_pipeline.py       tests for every step
+tests/test_hardware.py       gateway, historian, diagnostics, rule R5 and the Hardware Engineer
 tests/test_agents.py         agent, guardrail, scripted-Gemini and mock-server Claude tests
+tests/test_app.py            headless dashboard smoke tests (Streamlit AppTest)
 tests/test_storage.py        Supabase history (off without keys, failures never break a case)
 artifacts/bundle.pkl         trained models + test logs (committed for deployment)
 supabase/migrations/         SQL for the optional agent_cases table

@@ -1,10 +1,10 @@
 """LangGraph orchestration of the three agents, the G2 tool gateway and G3 independent verification.
 
-    G1 request  ->  Supervisor (S1)  ->  Data Analyst (S2, S3)  ->  Cooling Advisor (S4)
-                ->  G3 re-read + recompute  ->  Supervisor (S5) composes the released answer
+    G1 request  ->  Supervisor (S1)  ->  Data Analyst (S2, S3)  ->  Hardware Engineer (S6)
+                ->  Cooling Advisor (S4)  ->  G3 re-read + recompute  ->  Supervisor (S5) composes the answer
 
 Offline mode runs each role's procedure directly in a graph node (no LLM).
-Gemini and Claude modes replace the three role nodes with real parent/child function-calling loops
+Gemini and Claude modes replace the four role nodes with real parent/child function-calling loops
 (see llm_loops.py); all paths share the same tools, G2 gateway, G3 and S5.
 """
 import hashlib
@@ -20,6 +20,8 @@ import pandas as pd
 from langgraph.graph import END, START, StateGraph
 
 from .. import config as C
+from ..hardware.diagnostics import EquipmentWindow, summary_note
+from ..safety import RULES
 from . import tools as T
 from .models import CaseRequest, CaseResult, Check, Event, Policy
 from .skills import SKILLS
@@ -41,6 +43,7 @@ class Runtime:
         self.started = time.monotonic()
         self.result = CaseResult(case_id=case_id, at=request.at, mode=request.mode, agent_mode=request.agent_mode)
         self.window: T.CaseWindow | None = None
+        self.equipment: EquipmentWindow | None = None
         self.ready = False
         self.proposal: float | None = None
         self.proposal_made = False
@@ -109,12 +112,28 @@ def _summary(tool, value):
         return f"{value['proposed_c']:g} → {value['final_c']:g} °C" + (f" ({', '.join(value['rules_fired'])})" if value["rules_fired"] else "")
     if tool == "propose_setpoint":
         return f"proposed {value['proposed_setpoint_c']}"
+    if tool == "read_equipment":
+        lost = value["comm_loss"]
+        return f"{value['devices_polled'] - len(lost)}/{value['devices_polled']} devices answered" + (f"; no answer: {', '.join(lost)}" if lost else "")
+    if tool == "diagnose_equipment":
+        return f"{value['overall']} · constraint {value['constraint']} · {len(value['findings'])} finding(s)"
+    if tool == "call_hardware_engineer":
+        return f"constraint {value['constraint']}"
     return ""
 
 
 # -- shared tool implementations (used by both offline and Gemini roles) ---------------------
 def tool_impl(rt: Runtime, name: str, args=None):
     win, ctx = rt.window, rt.ctx
+    if name == "read_equipment":                       # hardware tools do not depend on the rack-sensor inspection
+        out = T.read_equipment(rt.equipment)
+        rt.result.evidence["equipment_read"] = {k: out[k] for k in ("devices_polled", "comm_loss", "bad_quality_points")}
+        return out
+    if name == "diagnose_equipment":
+        if "equipment_read" not in rt.result.evidence:
+            raise GuardError("EQUIPMENT_NOT_READ")
+        out = rt.result.evidence["equipment"] = T.diagnose_equipment(rt.equipment)
+        return out
     if name == "read_sensors":
         return T.read_sensors(win)
     if name == "inspect_data_quality":
@@ -133,7 +152,9 @@ def tool_impl(rt: Runtime, name: str, args=None):
         out = rt.result.evidence["mpc"] = T.run_mpc(win, ctx)
         return out
     if name == "check_safety":
-        out = rt.result.evidence["safety"] = T.check_safety(win, ctx, args["setpoint"])
+        if "equipment" not in rt.result.evidence:
+            raise GuardError("EQUIPMENT_NOT_INSPECTED")
+        out = rt.result.evidence["safety"] = T.check_safety(win, ctx, args["setpoint"], equipment_constraint(rt))
         return out
     raise GuardError("UNKNOWN_TOOL")
 
@@ -174,6 +195,33 @@ def data_analyst(state):
     return {}
 
 
+def equipment_constraint(rt: Runtime) -> str:
+    return rt.result.evidence.get("equipment", {}).get("constraint", "none")
+
+
+def finish_hardware(rt: Runtime, note: str):
+    """The Hardware Engineer's report to the Supervisor: constraint + the findings behind it."""
+    eq = rt.result.evidence["equipment"]
+    rt.result.agent_notes["hardware_engineer"] = note
+    return {"overall": eq["overall"], "constraint": eq["constraint"], "constraint_reasons": eq["constraint_reasons"],
+            "findings": [{k: f[k] for k in ("device", "code", "severity", "value", "unit", "days_to_next", "action")}
+                         for f in eq["findings"][:5]]}
+
+
+def hardware_engineer(state):
+    rt = state["runtime"]
+
+    def work():
+        rt.activate("S6", "hardware_engineer")
+        rt.call("read_equipment", "hardware_engineer", "S6", lambda: tool_impl(rt, "read_equipment"))
+        diag = rt.call("diagnose_equipment", "hardware_engineer", "S6", lambda: tool_impl(rt, "diagnose_equipment"))
+        return rt.call("finish_equipment_check", "hardware_engineer", "S6", lambda: finish_hardware(rt, summary_note(diag)))
+
+    report = rt.call("call_hardware_engineer", "supervisor", "S1", work)
+    rt.event("supervisor", "receive_hardware_report", "completed", detail=f"{report['overall']} · constraint {report['constraint']}")
+    return {}
+
+
 def cooling_advisor(state):
     rt = state["runtime"]
 
@@ -184,7 +232,8 @@ def cooling_advisor(state):
                          lambda: tool_impl(rt, "check_safety", {"setpoint": mpc["first_step_c"]}))
         rt.call("propose_setpoint", "cooling_advisor", "S4", lambda: propose(rt, safety["final_c"]))
         rt.result.agent_notes["cooling_advisor"] = (f"Cheapest safe plan {mpc['chosen_plan_c']} of {mpc['safe_plans']} safe plans; "
-                                                    f"safety filter returned {safety['final_c']:g} °C.")
+                                                    f"safety filter returned {safety['final_c']:g} °C"
+                                                    f" (hardware constraint {safety['equipment_constraint']}).")
 
     rt.call("call_cooling_advisor", "supervisor", "S1", work)
     rt.event("supervisor", "receive_proposal", "completed")
@@ -209,10 +258,11 @@ def validate(state):
                         detail="ready" if quality["ready"] else ", ".join(quality["errors"])))
     if quality["ready"] != rt.ready:
         raise GuardError("EVIDENCE_CHANGED")
+    constraint = verify_hardware(rt)
     if not quality["ready"]:
         rt.result.status, rt.result.decision = "insufficient_data", "fallback"
         rt.result.reason_codes = quality["errors"]
-        rt.result.recommended_setpoint = T.fallback_step(fresh, rt.ctx)
+        rt.result.recommended_setpoint = T.fallback_step(fresh, rt.ctx, constraint)
         rt.result.evidence["data_quality"] = quality
         rt.event("G3", "validate_evidence", "blocked", detail="AI withheld; safety rule R1 fallback applies")
         return {}
@@ -229,7 +279,7 @@ def validate(state):
         rt.result.status, rt.result.decision = "completed", "analysis_only"
         rt.event("G3", "validate_analysis", detail="Analysis only; no setpoint released")
         return {}
-    expected, reason, table, safety = T.expected_recommendation(fresh, rt.ctx)
+    expected, reason, table, safety = T.expected_recommendation(fresh, rt.ctx, constraint)
     rt.result.evidence["mpc"] = T.run_mpc(fresh, rt.ctx)
     rt.result.evidence["safety"] = safety
     rt.result.evidence["_plans"] = table
@@ -242,6 +292,12 @@ def validate(state):
     in_range = C.SP_MIN <= expected <= C.SP_MAX and abs(expected - fresh.setpoint_in_use) <= 2
     checks.append(Check(name="Within 16–24 °C and rate limit", passed=in_range))
     if not in_range:
+        raise GuardError("SETPOINT_OUT_OF_POLICY")
+    respects = constraint == "none" or expected <= fresh.setpoint_in_use
+    checks.append(Check(name="Hardware constraint respected (R5)", passed=respects,
+                        detail=f"constraint {constraint}" + (": no warmer than "
+                                                              f"{fresh.setpoint_in_use:g} °C" if constraint != "none" else "")))
+    if not respects:
         raise GuardError("SETPOINT_OUT_OF_POLICY")
     chosen = table[table["chosen"]].iloc[0]
     safe_plan = bool(chosen["safe"])
@@ -258,15 +314,34 @@ def validate(state):
     return {}
 
 
+def verify_hardware(rt: Runtime) -> str:
+    """G3 for the hardware layer: re-poll every device, re-run the diagnosis, compare with what the engineer reported."""
+    fresh = EquipmentWindow(rt.ctx.equipment, pd.Timestamp(rt.request.at), rt.policy.equipment_history_days,
+                            rt.request.equipment_fault)
+    diag = T.diagnose_equipment(fresh)
+    reported = rt.result.evidence.get("equipment")
+    codes = lambda d: [(f["device"], f["code"], f["severity"]) for f in d["findings"]]  # noqa: E731
+    same = reported is not None and reported["constraint"] == diag["constraint"] and codes(reported) == codes(diag)
+    rt.result.checks.append(Check(name="Hardware re-polled and re-diagnosed", passed=same,
+                                  detail=f"{diag['devices_answering']}/{diag['devices_polled']} devices · {diag['overall']} · "
+                                         f"constraint {diag['constraint']}"))
+    if not same:
+        raise GuardError("EQUIPMENT_EVIDENCE_MISMATCH")
+    rt.result.evidence["equipment"] = diag
+    return diag["constraint"]
+
+
 # -- S5: deterministic statement ---------------------------------------------------------------
 def supervisor_finalize(state):
     rt = state["runtime"]
     rt.activate("S5", "supervisor")
     r, ev = rt.result, rt.result.evidence
     mock = "Mock 12-rack room and simplified plant model; nothing was sent to equipment."
+    hw = f"Hardware: {summary_note(ev['equipment'])}" if "equipment" in ev else ""
     if r.status == "insufficient_data":
         r.explanation = (f"No AI recommendation: {', '.join(r.reason_codes)}. Safety rule R1 applies — return toward the proven "
-                         f"fallback setpoint {rt.ctx.fallback_sp:g} °C ({r.recommended_setpoint:g} °C this step, max 1 °C per 15 min). {mock}")
+                         f"fallback setpoint {rt.ctx.fallback_sp:g} °C ({r.recommended_setpoint:g} °C this step, max 1 °C per 15 min). "
+                         f"{hw} {mock}")
     elif r.status == "completed":
         s, hold = ev["state"], ev["forecast_hold"]
         risk = (f"Holding {hold['hold_setpoint_c']:g} °C for the next hour is forecast to peak at "
@@ -274,7 +349,7 @@ def supervisor_finalize(state):
         now = (f"Hottest rack {s['hottest_rack']} is {s['hottest_inlet_c']:.1f} °C ({s['headroom_to_limit_c']:.1f} °C below the limit), "
                f"IT {s['it_power_kw']:.0f} kW, cooling {s['cooling_kw']:.0f} kW.")
         if r.mode == "analyze":
-            r.explanation = f"{now} {risk} {mock}"
+            r.explanation = f"{now} {risk} {hw} {mock}"
         else:
             m, safety = ev["mpc"], ev["safety"]
             head = {"change": f"Change the supply-air setpoint from {r.setpoint_in_use:g} °C to {r.recommended_setpoint:g} °C now.",
@@ -288,11 +363,13 @@ def supervisor_finalize(state):
             else:
                 versus = f"{-saving:.1f} kWh more than holding" + ("" if m["hold_is_safe"] else ", the price of staying below the limit")
             plan = " → ".join(f"{v:g}" for v in r.plan)
-            rules = ", ".join(safety["rules_fired"]) or "no rule had to step in"
+            rules = "; ".join(f"{rid.split('_')[0]} {RULES[rid]}" for rid in safety["rules_fired"]) or "no rule had to step in"
+            if r.plan and r.plan[0] != r.recommended_setpoint:
+                rules += f" (the plan's first step {r.plan[0]:g} °C became {r.recommended_setpoint:g} °C)"
             r.explanation = (f"{head} {now} {risk} Of {m['plans_tried']} plans, {m['safe_plans']} stay safe; the cheapest is "
                              f"{plan} °C, forecast to use {m['chosen_energy_next_hour_kwh']:.1f} kWh next hour "
-                             f"({versus}). Safety filter: {rules}. G3 re-read the sensors and recomputed "
-                             f"this independently. {mock}")
+                             f"({versus}). Safety filter: {rules}. {hw} G3 re-read the sensors, re-polled the "
+                             f"hardware and recomputed this independently. {mock}")
     else:
         r.explanation = "No recommendation was released: " + ", ".join(r.reason_codes)
     rt.event("supervisor", "compose", "completed", "S5")
@@ -303,6 +380,7 @@ def build_graph():
     builder = StateGraph(GraphState)
     builder.add_node("supervisor_plan", supervisor_plan)
     builder.add_node("data_analyst", data_analyst)
+    builder.add_node("hardware_engineer", hardware_engineer)
     builder.add_node("cooling_advisor", cooling_advisor)
     # Imported only when a live case runs. agent_mode is "gemini" or "claude" here, the name of the provider module.
     builder.add_node("llm_agents", lambda s: import_module(f".{s['runtime'].request.agent_mode}", __package__).run_agents(s["runtime"]))
@@ -310,7 +388,8 @@ def build_graph():
     builder.add_node("supervisor_finalize", supervisor_finalize)
     builder.add_conditional_edges(START, lambda s: "supervisor_plan" if s["runtime"].request.agent_mode == "offline" else "llm_agents")
     builder.add_edge("supervisor_plan", "data_analyst")
-    builder.add_conditional_edges("data_analyst", lambda s: "cooling_advisor" if s["runtime"].ready and s["runtime"].request.mode == "recommend"
+    builder.add_edge("data_analyst", "hardware_engineer")            # hardware is checked even when rack data is not ready
+    builder.add_conditional_edges("hardware_engineer", lambda s: "cooling_advisor" if s["runtime"].ready and s["runtime"].request.mode == "recommend"
                                   else "guardrail_g3")
     builder.add_edge("cooling_advisor", "guardrail_g3")
     builder.add_edge("llm_agents", "guardrail_g3")
@@ -338,9 +417,13 @@ def run_case(request: CaseRequest, ctx: T.AgentContext | None = None, policy: Po
         first, last = ctx.log.index.min(), ctx.log.index.max()
         if not first + pd.Timedelta(hours=policy.history_hours) <= at <= last:
             raise GuardError("CASE_TIME_OUTSIDE_SENSOR_LOG")
+        if at not in ctx.equipment.index:
+            raise GuardError("CASE_TIME_OUTSIDE_EQUIPMENT_LOG")
         rt.window = T.CaseWindow(ctx.log, at, policy.history_hours, request.sensor_fault)
-        rt.event("G1", "validate_request", detail=f"{request.mode} · {request.agent_mode} · room zone-a · "
-                                                   f"tools see {policy.history_hours:g} h up to {at:%d %b %H:%M}")
+        rt.equipment = EquipmentWindow(ctx.equipment, at, policy.equipment_history_days, request.equipment_fault)
+        rt.event("G1", "validate_request", detail=f"{request.mode} · {request.agent_mode} · room zone-a · tools see "
+                                                   f"{policy.history_hours:g} h of sensors and {policy.equipment_history_days:g} "
+                                                   f"days of equipment data up to {at:%d %b %H:%M}")
         GRAPH.invoke({"runtime": rt}, config={"recursion_limit": 16})
     except GuardError as exc:
         r = rt.result

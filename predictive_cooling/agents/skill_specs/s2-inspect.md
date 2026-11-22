@@ -1,5 +1,5 @@
 # S2 — Inspect Sensor Data
-Owner: data_analyst. Version: 0.3.0.
+Owner: data_analyst. Version: 0.4.0.
 
 Call `read_sensors`, then `inspect_data_quality`. Tools only see readings at or before the case
 time (the last 2 hours); nothing from the future is available.

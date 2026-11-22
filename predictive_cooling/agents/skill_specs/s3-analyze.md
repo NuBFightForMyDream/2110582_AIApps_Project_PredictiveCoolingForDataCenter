@@ -1,5 +1,5 @@
 # S3 — Analyze & Forecast
-Owner: data_analyst. Version: 0.3.0.
+Owner: data_analyst. Version: 0.4.0.
 
 After a clean inspection call `summarize_state` (hottest rack, headroom to 27 °C, IT and cooling
 power, PUE, last-hour trend) and then `forecast_hold`: the trained gradient-boosting forecaster

@@ -3,6 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_PATH = ROOT / "data" / "sensor_history.csv"
+EQUIPMENT_PATH = ROOT / "data" / "equipment_telemetry.csv"   # field-device historian (hardware layer)
 ARTIFACT_DIR = ROOT / "artifacts"
 
 # Time grid: one control decision every 15 minutes, looking 60 minutes ahead.

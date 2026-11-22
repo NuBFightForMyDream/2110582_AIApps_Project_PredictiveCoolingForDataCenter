@@ -25,6 +25,12 @@ from predictive_cooling.evaluate import scenarios
 from predictive_cooling.mpc import MPC
 from predictive_cooling.agents import AgentContext, CaseRequest, plans_table, run_case
 from predictive_cooling.agents.skills import ROLES, SKILLS
+from predictive_cooling.hardware import telemetry as hw_telemetry
+from predictive_cooling.hardware.diagnostics import RULES as HW_RULES
+from predictive_cooling.hardware.diagnostics import EquipmentWindow, diagnose, metrics, summary_note
+from predictive_cooling.hardware.gateway import point_table
+from predictive_cooling.hardware.registry import (CRAH_RATED_AIRFLOW_M3H, CRAH_RATED_KW, DEVICES, REGISTRY,
+                                                  TRIPPABLE)
 from predictive_cooling.safety import RULES
 from threadpoolctl import threadpool_limits
 
@@ -128,7 +134,14 @@ def get_bundle():
     return bundle
 
 
+@st.cache_resource(show_spinner=False)
+def get_equipment():
+    """The equipment historian (data/equipment_telemetry.csv); built from the plant run in ~1 s if missing."""
+    return hw_telemetry.load()
+
+
 B = get_bundle()
+EQUIP = get_equipment()
 SC = scenarios()
 NAMES = B["controller_names"]
 LOGS = B["logs"]
@@ -140,9 +153,9 @@ HEAD = pipeline.headline(B)
 st.title("Predictive cooling for a data center", icon=":material/ac_unit:")
 st.markdown(
     "<p class='note'>Server rooms waste electricity by cooling more than they need. This project <b>forecasts the next "
-    "hour</b> and picks the warmest cooling setpoint that still keeps every rack below <b>27 °C</b>. Three AI agents "
-    "explain the decision to an operator. All data is a <b>mock</b> 12-rack room from a physics model; nothing controls "
-    "real equipment.</p>", unsafe_allow_html=True)
+    "hour</b> and picks the warmest cooling setpoint that still keeps every rack below <b>27 °C</b>. Four AI agents "
+    "check the room, its equipment and the options, and explain the decision to an operator. All data is a <b>mock</b> "
+    "12-rack room from a physics model; nothing controls real equipment.</p>", unsafe_allow_html=True)
 
 ai = HEAD["ai"]
 
@@ -182,10 +195,11 @@ flowchart LR
     Q(["Operator question"]):::step --> G1["G1 check request"]:::guard
     G1 --> SUP["Supervisor<br/>plans the case"]:::agent
     SUP --> DA["Data Analyst<br/>reads sensors + forecast<br/>(steps ①–③)"]:::agent
-    DA --> CA["Cooling Advisor<br/>81-plan MPC + safety<br/>(steps ④–⑤)"]:::agent
+    DA --> HE["Hardware Engineer<br/>polls 22 devices,<br/>limits · trends · N+1"]:::agent
+    HE --> CA["Cooling Advisor<br/>81-plan MPC + safety<br/>(steps ④–⑤)"]:::agent
     CA --> G3["G3 recompute<br/>everything, reject<br/>if it does not match"]:::guard
     G3 --> A(["Verified answer<br/>(recommend only)"]):::ok
-""", alt="Agent layer: operator question, G1, Supervisor, Data Analyst, Cooling Advisor, G3 verification, verified answer")
+""", alt="Agent layer: operator question, G1, Supervisor, Data Analyst, Hardware Engineer, Cooling Advisor, G3 verification, verified answer")
         st.caption("Every tool call passes guard G2 (allowed tools for that skill, budget, no peeking past the chosen time).")
 
 k = st.columns(5)
@@ -206,7 +220,7 @@ for col, label, value, note, icon, hlp in [
 agent_tab, *tabs = st.tabs([":material/smart_toy: Ask the agents", ":material/sensors: 1 · Sensors",
                             ":material/cleaning_services: 2 · Clean data", ":material/insights: 3 · Forecast",
                             ":material/route: 4 · MPC decision", ":material/shield: 5 · Safety",
-                            ":material/bolt: 6 · Results"])
+                            ":material/bolt: 6 · Results", ":material/memory: Hardware"])
 
 
 # ---------- ① sensors -----------------------------------------------------------------------
@@ -543,28 +557,34 @@ flowchart LR
 # ---------- ⑤ safety ------------------------------------------------------------------------
 with tabs[4]:
     st.subheader("What if something goes wrong?", icon=":material/shield:")
-    in_short("The AI only **proposes**. Four simple rules can override it before anything is sent.",
-             f"When in doubt, fall back to the old proven setpoint (**{B['fixed_sp']:.0f} °C**) — never worse than before.")
+    in_short("The AI only **proposes**. Five simple rules can override it before anything is sent.",
+             f"When in doubt, fall back to the old proven setpoint (**{B['fixed_sp']:.0f} °C**) — never worse than before.",
+             "**R5** listens to the Hardware Engineer: a cooling-equipment problem means *never run the room warmer* "
+             "(see the **Hardware** tab).")
     diagram("""
 flowchart LR
     P["MPC proposal"]:::ai --> R1{"R1 · sensor<br/>missing?"}:::guard
     R1 -- yes --> FB["Fallback setpoint"]:::ok
     R1 -- no --> R2{"R2 · conditions never<br/>seen in training?"}:::guard
     R2 -- yes --> FB
-    R2 -- no --> R3{"R3 · rack already<br/>near 27 °C?"}:::guard
+    R2 -- no --> R5{"R5 · hardware fault<br/>reported? (agent cases)"}:::guard
+    R5 -- no --> R3{"R3 · rack already<br/>near 27 °C?"}:::guard
+    R5 -- yes --> NW["No warmer than now<br/>(or than fallback)"]:::ok
+    NW --> R3
     R3 -- yes --> CO["Cool 2 °C now"]:::ok
     R3 -- no --> R4["R4 · max ±1 °C per step,<br/>stay within 16–24 °C"]:::guard
     R4 --> SEND["Send command"]:::ok
-""", alt="Safety filter: R1 missing sensor and R2 unfamiliar conditions go to fallback, R3 near limit cools 2 degrees, R4 limits rate and range")
-    st.markdown("<p class='note'>The MPC only <i>proposes</i>. Four rules check every command before it is sent. "
+""", alt="Safety filter: R1 missing sensor and R2 unfamiliar conditions go to fallback, R5 hardware fault blocks warmer setpoints, R3 near limit cools 2 degrees, R4 limits rate and range")
+    st.markdown("<p class='note'>The MPC only <i>proposes</i>. Five rules check every command before it is sent. "
                 f"Fallback = the proven fixed setpoint of <b>{B['fixed_sp']:.0f} °C</b>, so losing the AI returns the room to how "
-                "it was run before. Each fault scenario below runs all controllers through the same two test weeks.</p>",
-                unsafe_allow_html=True)
+                "it was run before. Each fault scenario below runs all controllers through the same two test weeks. "
+                "R5 takes the Hardware Engineer's constraint, so it fires in agent cases; the closed-loop study below has "
+                "no hardware faults and shows 0 for it.</p>", unsafe_allow_html=True)
     fired = {}
     for key in SC:
         rules = LOGS[key, "ai"]["rules"].fillna("").str.split(",").explode()
         fired[key] = rules[rules != ""].value_counts()
-    cols = st.columns(4)
+    cols = st.columns(len(RULES))
     for col, (rule, text) in zip(cols, RULES.items()):
         with col.container(border=True):
             st.markdown(f"**{rule.split('_')[0]}** · {text}")
@@ -674,8 +694,217 @@ with tabs[5]:
         st.markdown(f"Baselines were tuned on the validation weeks: fixed = highest setpoint with no overheating "
                     f"(**{B['fixed_sp']:.0f} °C**); rule-based = lowest-energy safe deadband ({B['rule_text']}).")
 
+# ---------- hardware ------------------------------------------------------------------------
+KEY_POINTS = {
+    "crah": [("supply_air_c", "Supply"), ("fan_speed_pct", "Fan"), ("filter_dp_pa", "Filter ΔP")],
+    "chiller": [("load_pct", "Load"), ("cop", "COP"), ("cond_approach_c", "Cond. approach")],
+    "pump": [("flow_m3h", "Flow"), ("vibration_mm_s", "Vibration"), ("bearing_temp_c", "Bearing")],
+    "cooling_tower": [("fan_speed_pct", "Fan"), ("wet_bulb_c", "Wet bulb"), ("approach_c", "Approach")],
+    "ups": [("load_pct", "Load"), ("output_kw", "Output"), ("battery_temp_c", "Battery")],
+    "env": [("temp_c", "Temp"), ("rh_pct", "RH"), ("aisle_dp_pa", "Over-pressure")],
+}
+HW_FROM = "2026-04-06"                     # trend panels: two weeks of build-up before the test weeks, then the test weeks
+WARN, CRIT = "#eb6834", LIMIT
+
+
+@st.cache_data(max_entries=48, show_spinner=False)
+def hardware_state(at: str, trips: tuple = ()):
+    """Gateway poll + diagnosis at one moment (what the Hardware Engineer would see)."""
+    win = EquipmentWindow(EQUIP, pd.Timestamp(at), trips=trips)
+    return win.snapshot, diagnose(win)
+
+
+@st.cache_data(show_spinner=False)
+def hardware_trends():
+    """Hourly series of the metrics the diagnostics use, for the trend panels."""
+    pdu = EQUIP[[REGISTRY[f"PDU-{r}"].column("power_kw") for r in C.RACKS]].sum(axis=1, min_count=len(C.RACKS))
+    peak7 = pdu.rolling("7D").max()
+    frame = EQUIP.loc[HW_FROM:]
+    out = pd.DataFrame(index=frame.index)
+    for u in (1, 2):
+        crah = REGISTRY[f"CRAH-{u}"]
+        speed = frame[crah.column("fan_speed_pct")] / 100
+        out[f"filter_{u}"] = metrics(frame, crah)["filter_dp_100_pa"]
+        out[f"cap_{u}"] = CRAH_RATED_KW * (frame[crah.column("airflow_m3h")] / (CRAH_RATED_AIRFLOW_M3H * speed)).clip(0.5, 1.0)
+    out["vibration"] = frame["CHWP-1.vibration_mm_s"]
+    out["approach"] = frame["CH-1.cond_approach_c"]
+    for sensor in ("ENV-CA-1", "ENV-CA-2"):
+        out[sensor] = metrics(frame, REGISTRY[sensor])["rh_deviation_pct"]
+    out["peak7"] = peak7.loc[HW_FROM:]
+    out["dp"] = frame["ENV-DP-1.aisle_dp_pa"]
+    return out.resample("1h").mean()
+
+
+SEVERITY_BADGE = {"ok": ("OK", "green"), "watch": ("Watch", "blue"), "warning": ("Warning", "orange"),
+                  "critical": ("Critical", "red")}
+CONSTRAINT_TEXT = {"none": "None — the AI may run warmer", "no_raise": "No warmer than now",
+                   "fallback": "No warmer than now or than fallback"}
+
+
+def findings_frame(diag):
+    rows = [{"Severity": SEVERITY_BADGE[f["severity"]][0], "Device": f["device"], "Finding": f["code"],
+             "What": f["label"], "Now": None if f["value"] is None else f"{f['value']:g} {f['unit']}".strip(),
+             "Limit": None if f["limit"] is None else f"{f['limit']:g}",
+             "Next limit": None if f["days_to_next"] is None else f"{f['next_severity']} {f['next_limit']:g} in ~{f['days_to_next']:g} d",
+             "Constraint": f["constraint"], "Action": f["action"], "Basis": f["basis"]} for f in diag["findings"]]
+    return pd.DataFrame(rows, columns=["Severity", "Device", "Finding", "What", "Now", "Limit", "Next limit", "Constraint",
+                                       "Action", "Basis"])
+
+
+def hardware_panel(diag):
+    """The Hardware Engineer's report inside an agent case."""
+    with st.container(border=True):
+        label, color = SEVERITY_BADGE[diag["overall"]]
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(":material/memory: **Hardware Engineer's report** (re-checked by G3)")
+            st.badge(label, color=color)
+            st.badge(f"Constraint: {CONSTRAINT_TEXT[diag['constraint']]}", color="gray" if diag["constraint"] == "none" else "orange",
+                     icon=":material/lock:" if diag["constraint"] != "none" else ":material/lock_open:")
+        st.caption(summary_note(diag))
+        if diag["findings"]:
+            st.dataframe(findings_frame(diag)[["Severity", "Device", "Finding", "Now", "Limit", "Next limit", "Constraint", "Action"]],
+                         hide_index=True, width="stretch")
+
+
+def hw_limit(fig, y, row, col, text, color):
+    fig.add_hline(y=y, line=dict(color=color, width=1.2, dash="dot"), annotation_text=text, annotation_position="top left",
+                  annotation_font=dict(color=color, size=10.5), row=row, col=col)
+
+
+def rule_limits(code):
+    rule = next(r for r in HW_RULES if r.code == code)
+    return rule.warning, rule.critical
+
+
+with tabs[6]:
+    st.subheader("What the equipment itself says", icon=":material/memory:")
+    in_short(f"**{len(DEVICES)} field devices** — 2 CRAH units, a chiller, 2 chilled-water pumps, a cooling tower, the UPS, "
+             "3 room sensors and 12 rack PDUs — are polled every 15 minutes over **BACnet/IP, Modbus TCP and SNMP v3**.",
+             "The **sensor gateway** decodes each raw register with the point map and flags what it cannot trust "
+             "(impossible value, saturated register, device not answering).",
+             "The **Hardware Engineer** agent checks limits (ISO 10816 vibration, ASHRAE humidity, filter ΔP), projects "
+             "7-day trends to *days until the next limit* and checks **N+1** cooling capacity. A cooling-equipment problem "
+             "stops the AI from running the room warmer (rule **R5**).")
+    diagram("""
+flowchart LR
+    D["22 field devices<br/>CRAH · chiller · pumps · tower<br/>UPS · room sensors · PDUs"]:::step --> P["BACnet/IP<br/>Modbus TCP · SNMP v3"]:::step
+    P --> GW["Sensor gateway<br/>raw register → °C, kW, Pa<br/>+ quality flag"]:::guard
+    GW --> H[("Historian<br/>15-min, 7 days")]:::step
+    GW --> DX["Diagnostics<br/>limits · trends · N+1"]:::ai
+    H --> DX
+    DX --> HE["Hardware Engineer<br/>(skill S6)"]:::agent
+    HE --> SUP["Supervisor"]:::agent
+    HE -.->|"cooling constraint"| R5["Safety rule R5<br/>no warmer than now"]:::guard
+""", alt="Hardware layer: field devices, building protocols, sensor gateway, historian, diagnostics, Hardware Engineer, Supervisor and safety rule R5")
+
+    c1, c2, c3 = st.columns([1, 1.6, 1.4], vertical_alignment="bottom")
+    hw_day = c1.selectbox("Day", TEST_DAYS, index=TEST_DAYS.index(pd.Timestamp("2026-04-29").date()),
+                          format_func=lambda d: f"{pd.Timestamp(d):%a %d %b}", key="hw_day")
+    hw_clock = c2.select_slider("Time", options=[f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)],
+                                value="05:30", key="hw_time")
+    hw_trips = c3.pills("Simulate a trip", list(TRIPPABLE), selection_mode="multi", key="hw_trips",
+                        help="The device stops (status 0) for the last 30 minutes")
+    hw_at = pd.Timestamp(f"{hw_day} {hw_clock}")
+    snapshot, hw = hardware_state(str(hw_at), tuple(hw_trips or ()))
+    cap = hw["capacity"]
+    label, color = SEVERITY_BADGE[hw["overall"]]
+    k = st.columns(5)
+    k[0].metric("Devices answering", f"{hw['devices_answering']} / {hw['devices_polled']}", border=True,
+                help="A device that does not answer its poll is unknown, not healthy")
+    k[1].metric("Equipment health", label, border=True)
+    k[2].metric("Cooling constraint", hw["constraint"].replace("_", " "), border=True,
+                help="none · no raise (never warmer than now) · fallback (never warmer than the proven setpoint)")
+    note_metric(k[3], "N+1 capacity", f"{cap['n_minus_1_capacity_kw']:.0f} kW", f"week peak {cap['peak_it_kw_7d']:.0f} kW",
+                help="If any one CRAH fails, can the other carry the highest IT load of the last 7 days?")
+    k[4].metric("Findings", f"{len(hw['findings'])}", border=True)
+
+    st.markdown(f"**Devices at {hw_at:%a %d %b %H:%M}**")
+    plant = [d for d in DEVICES if d.kind != "pdu"]
+    for start in range(0, len(plant), 5):
+        cols = st.columns(5)
+        for col, device in zip(cols, plant[start:start + 5]):
+            reading = snapshot[device.id]
+            with col.container(border=True, height="stretch"):
+                if reading["comm"] != "ok":
+                    tag, tag_color = "No answer", "gray"
+                elif device.standby and reading["values"].get("status") == 0:
+                    tag, tag_color = "Standby", "gray"
+                else:
+                    tag, tag_color = SEVERITY_BADGE[hw["device_health"][device.id]]
+                st.markdown(f"**{device.id}** :{tag_color}-badge[{tag}]")
+                st.caption(f"{device.name} · {device.protocol}")
+                lines = [f"{name} **{reading['values'][point]:g}** {device.point(point).unit}"
+                         for point, name in KEY_POINTS[device.kind] if reading["values"].get(point) is not None]
+                st.markdown("  \n".join(lines) or ":gray[—]")
+
+    if hw["findings"]:
+        st.markdown("**Findings** — sorted by severity; *constraint* is what the Cooling Advisor's safety check (R5) receives")
+        st.dataframe(findings_frame(hw), hide_index=True, width="stretch",
+                     column_config={"Basis": st.column_config.TextColumn(width="large"),
+                                    "Action": st.column_config.TextColumn(width="medium")})
+    else:
+        st.success("All 22 devices are within their limits and N+1 cooling capacity holds.", icon=":material/check_circle:")
+
+    trend = hardware_trends()
+    fig = make_subplots(rows=3, cols=2, shared_xaxes=True, vertical_spacing=0.1, horizontal_spacing=0.08,
+                        subplot_titles=("CRAH filter ΔP at 100 % fan (Pa)", "CHWP-1 vibration (mm/s RMS)",
+                                        "CH-1 condenser approach (°C)", "Humidity sensor vs CRAH reference (|Δ| %RH)",
+                                        "N+1: one CRAH's capacity vs week-peak IT (kW)", "Cold-aisle over-pressure (Pa)"))
+    fig.add_scatter(x=trend.index, y=trend["filter_1"], name="CRAH-1", line=dict(color=MUTED, width=1.6), row=1, col=1)
+    fig.add_scatter(x=trend.index, y=trend["filter_2"], name="CRAH-2", line=dict(color=CTRL["ai"], width=2), row=1, col=1)
+    fig.add_scatter(x=trend.index, y=trend["vibration"], name="CHWP-1", line=dict(color=CTRL["ai"], width=2), row=1, col=2,
+                    showlegend=False)
+    fig.add_scatter(x=trend.index, y=trend["approach"], name="CH-1", line=dict(color=CTRL["ai"], width=2), row=2, col=1,
+                    showlegend=False)
+    fig.add_scatter(x=trend.index, y=trend["ENV-CA-1"], name="ENV-CA-1", line=dict(color=MUTED, width=1.6), row=2, col=2)
+    fig.add_scatter(x=trend.index, y=trend["ENV-CA-2"], name="ENV-CA-2", line=dict(color=QTY["temp"], width=2), row=2, col=2)
+    fig.add_scatter(x=trend.index, y=trend["cap_2"], name="CRAH-2 capacity", line=dict(color=CTRL["ai"], width=2), row=3, col=1)
+    fig.add_scatter(x=trend.index, y=trend["peak7"], name="Week-peak IT load", line=dict(color=QTY["it"], width=2, shape="hv"),
+                    row=3, col=1)
+    fig.add_scatter(x=trend.index, y=trend["dp"], name="ENV-DP-1", line=dict(color=CTRL["ai"], width=2), row=3, col=2,
+                    showlegend=False)
+    for code, row, col in [("FILTER_LOADING", 1, 1), ("BEARING_WEAR", 1, 2), ("CONDENSER_FOULING", 2, 1), ("SENSOR_DRIFT", 2, 2)]:
+        warning, critical = rule_limits(code)
+        hw_limit(fig, warning, row, col, f"warning {warning:g}", WARN)
+        if code in ("BEARING_WEAR", "CONDENSER_FOULING"):
+            hw_limit(fig, critical, row, col, f"critical {critical:g}", CRIT)
+    hw_limit(fig, rule_limits("CONTAINMENT_PRESSURE")[0], 3, 2, "warning 1", WARN)
+    fig.add_vline(x=hw_at, line=dict(color=INK2, width=1))
+    show(style(fig, height=640, title="Four faults hidden in the equipment data, seen days before any rack gets hot"))
+    st.caption("Hourly means. The room-level sensor log shows none of this yet — that is why the hardware is watched directly. "
+               "The grey line marks the moment picked above.")
+
+    c1, c2 = st.columns([1, 1.25])
+    with c1:
+        racks = pd.Series({r: snapshot[f"PDU-{r}"]["values"].get("power_kw") for r in C.RACKS}, dtype=float)
+        fig = go.Figure(go.Bar(x=racks.index, y=racks.values, width=0.6,
+                               marker_color=[CTRL["ai"] if C.RACK_ROLE[r] == "GPU" else AXIS for r in racks.index],
+                               text=[f"{v:.1f}" for v in racks.values], textposition="outside", cliponaxis=False,
+                               hovertemplate="%{x}: %{y:.2f} kW<extra></extra>"))
+        fig.update_yaxes(title="kW", rangemode="tozero")
+        show(style(fig, height=300, title=f"Rack power from the 12 PDUs · {racks.sum():.0f} kW", legend=False, hover="closest"))
+        st.caption("Blue = GPU racks B4–B6. The PDUs (SNMP) give the IT load per rack; the N+1 check uses their sum.")
+    with c2:
+        device_id = st.selectbox("Gateway view: one device's points", list(REGISTRY), index=list(REGISTRY).index("CRAH-2"),
+                                 format_func=lambda d: f"{d} · {REGISTRY[d].protocol} · {REGISTRY[d].endpoint}", key="hw_dev")
+        st.dataframe(point_table(snapshot[device_id]), hide_index=True, width="stretch")
+        st.caption("Raw value = what the protocol carries (BACnet REAL, Modbus 16-bit register × scale, SNMP integer). "
+                   "The gateway decodes it and checks the physical range before anything downstream sees it.")
+
+    with st.expander("Faults hidden in the equipment data, and how the file is made"):
+        st.markdown("\n".join(f"- **{f['device']} · {f['code']}** (from {pd.Timestamp(f['start']):%d %b %H:%M}): {f['story']}"
+                              for f in hw_telemetry.FAULTS))
+        st.markdown("<p class='note'>data/equipment_telemetry.csv is the equipment historian: 69 points from 22 devices every "
+                    "15 minutes, derived from the same plant run as sensor_history.csv (same seeds, so temperatures and power "
+                    "agree), plus chilled/condenser-water temperatures, pump flow, filter ΔP, humidity, containment pressure and "
+                    "per-rack PDU power. Rebuild it with <code>python -m predictive_cooling.hardware</code>.</p>",
+                    unsafe_allow_html=True)
+        st.download_button("Download equipment_telemetry.csv", data=C.EQUIPMENT_PATH.read_bytes, file_name="equipment_telemetry.csv",
+                           mime="text/csv", icon=":material/download:")
+
+
 # ---------- 🤖 agents -----------------------------------------------------------------------
-LANES = ["G1", "supervisor", "G2", "data_analyst", "cooling_advisor", "G3", "workflow"]
+LANES = ["G1", "supervisor", "G2", "data_analyst", "hardware_engineer", "cooling_advisor", "G3", "workflow"]
 LANE_NAME = {"G1": "G1 request", "G2": "G2 gateway", "G3": "G3 verify", "workflow": "Workflow", **ROLES}
 STATUS_COLOR = {"passed": "#1baf7a", "completed": "#2a78d6", "authorized": "#86b6ef", "blocked": LIMIT,
                 "rejected": LIMIT, "failed": LIMIT}
@@ -683,7 +912,7 @@ STATUS_COLOR = {"passed": "#1baf7a", "completed": "#2a78d6", "authorized": "#86b
 
 @st.cache_resource(show_spinner=False)
 def agent_context():
-    return AgentContext.from_bundle(B)
+    return AgentContext.from_bundle(B, EQUIP)
 
 
 def trace_chart(result):
@@ -703,7 +932,7 @@ def trace_chart(result):
     fig.data = fig.data[-1:] + fig.data[:-1]
     fig.update_yaxes(categoryorder="array", categoryarray=[LANE_NAME[x] for x in reversed(LANES)])
     fig.update_xaxes(title="step", dtick=2)
-    return style(fig, height=330, title="Who did what, in order (hover a dot)", hover="closest")
+    return style(fig, height=360, title="Who did what, in order (hover a dot)", hover="closest")
 
 
 @st.fragment
@@ -718,21 +947,24 @@ def agent_case_panel():
         mode = st.segmented_control("Task", ["recommend", "analyze"], default="recommend",
                                     format_func={"recommend": "Recommend a setpoint", "analyze": "Analyze only"}.get) or "recommend"
         fault = st.multiselect("Simulate failed sensors", C.RACKS, default=[], help="These racks stop reporting for the last 45 min")
+        trips = st.multiselect("Simulate equipment trip", list(TRIPPABLE), default=[],
+                               help="These cooling devices stop (status 0) for the last 30 min; the Hardware Engineer "
+                                    "should report it and R5 should stop the AI from running warmer")
     with c3:
         agent_mode = st.segmented_control("Agent mode", ["offline", "gemini", "claude"], default="offline",
                                           format_func={"offline": "Offline roles", "gemini": "Gemini", "claude": "Claude Haiku"}.get) or "offline"
         key_name = {"gemini": "GEMINI_API_KEY", "claude": "ANTHROPIC_API_KEY"}.get(agent_mode)
         st.caption("Offline = fixed role procedures, no LLM, instant. Gemini and Claude Haiku = real function calling, "
-                   "about 11 model calls."
+                   "about 15 model calls."
                    + ("" if key_name is None else " API key found." if os.getenv(key_name)
                       else f" Set {key_name} to enable; without it the case fails closed."))
     question = st.text_input("Operator question", "What supply-air setpoint should we use for the next hour, and why?")
     request = CaseRequest(at=pd.Timestamp(f"{case_day} {case_time}").to_pydatetime(), question=question, mode=mode,
-                          agent_mode=agent_mode, sensor_fault=tuple(fault))
+                          agent_mode=agent_mode, sensor_fault=tuple(fault), equipment_fault=tuple(trips))
     key = request.model_dump_json()
     if st.button("Run case", type="primary") or st.session_state.get("case_key") != key and "case" not in st.session_state:
         started = time.monotonic()
-        steps = st.status("Agents working…" + (" Gemini usually needs 30–60 s." if agent_mode == "gemini" else ""),
+        steps = st.status("Agents working…" + (" Gemini usually needs 40–80 s." if agent_mode == "gemini" else ""),
                           expanded=agent_mode != "offline")
 
         def progress(event):
@@ -787,6 +1019,8 @@ def agent_case_panel():
                 for role, note in result.agent_notes.items():
                     st.markdown(f"- *{ROLES.get(role, role)}*: {note}")
         ev = result.evidence
+        if "equipment" in ev:
+            hardware_panel(ev["equipment"])
         if "forecast_hold" in ev:
             hold = ev["forecast_hold"]
             at = pd.Timestamp(result.at)
@@ -828,7 +1062,9 @@ def agent_case_panel():
 
 with agent_tab:
     st.subheader("Ask the agents about a moment in the room", icon=":material/smart_toy:")
-    in_short("Pick a moment and press **Run case**. Three agents split the work like a small team.",
+    in_short("Pick a moment and press **Run case**. Four agents split the work like a small team.",
+             "The **Hardware Engineer** reports on the equipment itself; a cooling-equipment problem stops the AI from "
+             "running the room warmer (rule R5). Try 29 Apr 05:30, or simulate a CRAH trip.",
              "Agents never compute numbers themselves — they call checked tools, and **G3 recomputes everything** before "
              "an answer is released.")
     diagram("""
@@ -836,21 +1072,26 @@ sequenceDiagram
     participant O as Operator
     participant S as Supervisor
     participant D as Data Analyst
+    participant H as Hardware Engineer
     participant C as Cooling Advisor
     participant G as G3 verify
     O->>S: question + moment (checked by G1)
     S->>D: inspect sensors, forecast next hour
     D-->>S: data OK? hold-setpoint forecast
+    S->>H: poll the equipment, check health
+    H-->>S: findings + cooling constraint
     S->>C: find the best safe setpoint
-    C-->>S: proposal (81-plan MPC + safety)
-    S->>G: re-read sensors, recompute all
+    C-->>S: proposal (81-plan MPC + safety, R5)
+    S->>G: re-read sensors, re-poll hardware, recompute all
     G-->>O: verified answer (or fallback)
-""", alt="Sequence: operator asks Supervisor, Supervisor delegates to Data Analyst then Cooling Advisor, G3 verifies before answering")
+""", alt="Sequence: operator asks Supervisor, Supervisor delegates to Data Analyst, Hardware Engineer and Cooling Advisor, G3 verifies before answering")
     st.markdown("<p class='note'>The <b>Supervisor</b> plans the case and delegates. The <b>Data Analyst</b> inspects the "
-                "sensors (S2), summarises the room and forecasts the next hour (S3). The <b>Cooling Advisor</b> runs the 81-plan "
-                "MPC and the safety filter and proposes a setpoint (S4). <b>G2</b> checks every tool call against the skill's "
-                "allowlist and budget; <b>G3</b> re-reads the sensors and recomputes everything before anything is released; the "
-                "Supervisor then writes the verified answer (S5). Tools only see the 2 hours up to the chosen moment.</p>",
+                "sensors (S2), summarises the room and forecasts the next hour (S3). The <b>Hardware Engineer</b> polls the 22 "
+                "field devices through the sensor gateway and checks their health (S6). The <b>Cooling Advisor</b> runs the "
+                "81-plan MPC and the safety filter, including the hardware constraint, and proposes a setpoint (S4). <b>G2</b> "
+                "checks every tool call against the skill's allowlist and budget; <b>G3</b> re-reads the sensors, re-polls the "
+                "hardware and recomputes everything before anything is released; the Supervisor then writes the verified answer "
+                "(S5). Tools only see the 2 hours of sensors and 7 days of equipment data up to the chosen moment.</p>",
                 unsafe_allow_html=True)
     agent_case_panel()
 
