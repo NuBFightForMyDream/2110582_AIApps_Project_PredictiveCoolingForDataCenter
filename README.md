@@ -8,7 +8,9 @@ an operator's question about the room by calling guarded Python tools. The tools
 forecast → 81-plan MPC → safety filter, with a simulated room (plant) as the judge, plus a **hardware layer**: a sensor gateway
 that polls 22 field devices over BACnet/IP, Modbus TCP and SNMP v3, and diagnostics that tell the agents when the equipment
 itself (filters, pumps, chiller, sensors) is going wrong, and a **security layer**: an ML integrity model and replay detection
-that catch forged sensor data, a prompt-injection screen, signed recommendations and a hash-chained audit trail. The original agent architecture is kept: LangGraph, skills S1–S5,
+that catch forged sensor data, a prompt-injection screen, signed recommendations and a hash-chained audit trail. The
+**Data center** view draws the whole site (air, chilled water, condenser water, electricity) with the installed model of
+every device and sensor, and an **upgrade advisor** measures each hardware option in closed loop together with the AI. The original agent architecture is kept: LangGraph, skills S1–S5,
 guardrails G1/G2/G3, and offline or Gemini mode. What changed is what the agents work with. They now read **sensor data from the
 data center**, use a **forecaster trained on a mock sensor dataset**, and choose a setpoint with **MPC**. Infrastructure that was
 not needed for the idea (FastAPI, Supabase/auth, SustainDC install, CSV import) is removed.
@@ -68,7 +70,7 @@ flowchart TD
 | Supervisor (parent) | S1 Plan, S5 Compose | `call_data_analyst`, `call_security_analyst`, `call_hardware_engineer`, `call_cooling_advisor`, `finish_case` |
 | Data Analyst (child) | S2 Inspect, S3 Analyze & Forecast | `read_sensors`, `inspect_data_quality`, `summarize_state`, `forecast_hold`, `finish_analysis` |
 | Security Analyst (child) | S7 Verify data integrity | `check_sensor_integrity`, `audit_command_channel`, `finish_security_review` |
-| Hardware Engineer (child) | S6 Inspect equipment health | `read_equipment`, `diagnose_equipment`, `finish_equipment_check` |
+| Hardware Engineer (child) | S6 Inspect equipment health, S8 Plan upgrades (task `upgrade`) | `read_equipment`, `diagnose_equipment`, `evaluate_upgrades`, `finish_equipment_check` |
 | Cooling Advisor (child) | S4 Evaluate plans | `run_mpc`, `check_safety`, `propose_setpoint` |
 
 | Guard | Where | Checks | Stops with |
@@ -265,6 +267,54 @@ Minutes with a true rack inlet above 27 °C. The integrity monitor never fires i
 commands and every result above are identical with and without it. Limits: a forgery smaller than ~1 °C is not caught (the
 forecaster's safety margin absorbs most of it), and an attacker who controls both the BMS and the PDU network is out of scope.
 
+## Equipment, flows and upgrades (physical + AI)
+
+**What is installed** (`hardware/catalog.py`, shown in the *Data center* tab with links). Named products are real product
+families with the vendor-published facts used here (checked Nov 2026); legacy units without a verified model are described
+by class. The plant model's own numbers (capacity, COP, fan power) are this project's, not datasheet values.
+
+| Where | Installed | Facts used |
+|---|---|---|
+| CRAH-1/2 | Legacy chilled-water CRAH, AC belt-driven fans (class) | 140 kW sensible, 34,000 m³/h each (site model) |
+| CH-1 | Fixed-speed water-cooled screw chiller, 250 kW (class) | COP 3.6 at reference (site model) |
+| UPS-1 | Eaton 93PM 200 kVA | up to 97 % double conversion, > 99 % in ESS mode |
+| Rack PDUs ×12 | Raritan PX3 | ±1 % billing-grade metering, SNMPv3 |
+| Rack inlets ×12 / cold aisle | APC NetBotz AP9335T / AP9335TH | ±2 °C; ±4 %RH (20–90 %RH at 25 °C) |
+| Containment ΔP | Setra Model 264, 0–0.1 in. W.C. | ±1 % FS (listed as discontinued: plan a replacement) |
+| Sub-meters | Schneider PowerLogic PM5560 | Class 0.2S, Modbus TCP + BACnet/IP |
+| Chilled-water flow | Siemens SITRANS F M MAG 5100 W + MAG 5000 | ±0.4 % of rate |
+| Pump vibration | ifm VKV021 | 0–25 mm/s RMS, 4–20 mA, to DIN ISO 10816 |
+
+**Flows** (`hardware/flows.py`): at any moment, the *Data center* tab draws the plant (roof, plant room, data hall,
+electrical room) with live values and model names on hover, plus two Sankey diagrams: where the electricity goes (grid →
+UPS → rack groups, chiller, CRAH fans, pumps + tower, lighting) and where the heat goes (servers + fans + walls → chilled
+water → chiller → condenser water → cooling tower → outdoor air). Both balance exactly.
+
+**Upgrade advisor** (`hardware/upgrades.py`, `hardware/advisor.py`). Each option changes the plant model conservatively
+against the vendor claims, and runs the two test weeks on the upgraded room with the rule-based controller (*hardware
+alone*), with today's AI and, where the room's behaviour changes, with the AI **retrained** on a simulated history of the
+upgraded room (*physical + AI*, ~3 s to retrain). Savings are measured by the plant against today's AI on today's room
+(1,151 MWh/yr facility, PUE 1.471) and annualised:
+
+| Option (example products) | Hardware alone | **With the AI** | Cooling | kWh/yr | THB/yr | tCO₂/yr | CAPEX (assumed) | Payback |
+|---|---|---|---|---|---|---|---|---|
+| UPS ESS mode (Eaton 93PM) | 1.98 % | **2.38 %** | 0.0 % | 27,384 | 109,537 | 12.0 | 0.03 M THB | **0.2 yr** |
+| PM variable-speed pumps (Grundfos TPE3) | 0.30 % | **0.70 %** | 2.6 % | 8,090 | 32,360 | 3.5 | 0.40 M | 12.4 yr |
+| EC fans in both CRAHs (ebm-papst RadiPac/RadiFit, or Liebert PCW) | 1.16 % | **1.56 %** | 5.8 % | 17,996 | 71,984 | 7.9 | 0.90 M | 12.5 yr |
+| All of the above | 8.91 % | **9.28 %** | 25.6 % | 106,811 | 427,246 | 46.7 | 7.58 M | 17.7 yr |
+| Cold-aisle containment (Vertiv SmartAisle or similar) | 0.46 % | **0.87 %** | 3.2 % | 10,051 | 40,203 | 4.4 | 0.75 M | 18.7 yr |
+| Oil-free magnetic-bearing chiller (Danfoss Turbocor compressors) | 3.46 % | **3.85 %** | 14.3 % | 44,320 | 177,279 | 19.4 | 5.50 M | 31 yr |
+
+Facility energy saved; no option let a rack exceed 27 °C. CO₂ uses Thailand's grid factor 0.4371 tCO₂/MWh (TGO, 2022);
+electricity 4 THB/kWh. CAPEX values are **budget assumptions** for a 12-rack room (editable in the dashboard), not quotes.
+What it says: switch the UPS to ESS first (after a risk review); fix the hardware findings (filter, bearing) before buying
+anything; the chiller only pays back at end of life. With containment the AI sits at the **24 °C setpoint ceiling 88 % of
+the time**: the racks would allow warmer, so the site's setpoint policy becomes the limit. After any physical change the
+sensor-integrity model must be re-baselined (a contained room looks "forged" to the old physics model).
+
+Ask the agents with the task *Plan upgrades*: the Hardware Engineer runs S6 then S8, and G3 recomputes the plan from the
+stored study.
+
 ## The steps in code
 
 | Step | File | What it does |
@@ -278,7 +328,7 @@ forecaster's safety margin absorbs most of it), and an attacker who controls bot
 | ⑥ | `plant.py`, `evaluate.py` | The simulated room is the judge: 14-day closed-loop runs in 4 scenarios |
 | | `pipeline.py` | Runs every step end to end and tunes the baselines on validation (fixed = highest setpoint that never overheated, rule = lowest-energy deadband that never overheated) |
 | | `security/` | Security layer: `integrity.py` (ML integrity model, replay, closed-loop monitor), `commands.py` (command audit + verdict), `attacks.py` (simulated attacks), `prompt_guard.py` (G1/G4), `signing.py`, `audit.py`, `ratelimit.py`, `posture.py` (protocols + STRIDE) |
-| | `hardware/` | Hardware layer: `registry.py` (22 devices, point map), `gateway.py` (poll + decode + quality), `telemetry.py` (equipment historian + injected faults), `diagnostics.py` (limits, trends, N+1, constraint) |
+| | `hardware/` | Hardware layer: `registry.py` (22 devices, point map), `gateway.py` (poll + decode + quality), `telemetry.py` (equipment historian + injected faults), `diagnostics.py` (limits, trends, N+1, constraint), `catalog.py` (installed models, instruments, upgrade products + sources), `flows.py` (power/heat balance), `upgrades.py` + `advisor.py` (closed-loop upgrade study, payback ranking) |
 | | `agents/` | Agent layer: `engine.py` (LangGraph, G1–G4, S5), `tools.py` (the tools above), `llm_loops.py` (function-calling loops), `gemini.py` + `claude.py` (providers), `skills.py` + `skill_specs/` (S1–S7) |
 | | `app.py` | Dashboard: “Ask the agents” tab + 6 tabs, one per step |
 
@@ -428,7 +478,11 @@ Ask the agents from the command line:
 .venv/bin/python -m predictive_cooling.agents --at "2026-04-21 02:00" --attack spoofing
 ```
 
-Tests (90 tests including headless dashboard smoke tests, about 4.5 minutes):
+```bash
+.venv/bin/python -m predictive_cooling.agents --at "2026-04-29 05:30" --mode upgrade
+```
+
+Tests (102 tests including headless dashboard smoke tests, about 5.5 minutes):
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -477,7 +531,7 @@ names as environment variables.
 
 Every tab starts with an **In short** box (the message in plain language) and, where it helps, a diagram of the step.
 
-0. **Ask the agents**: pick a moment, a task (recommend / analyze), optional failed sensors, equipment trips or a simulated cyber attack, and the agent mode. You see the answer, a swimlane trace of who did what (G1 → Supervisor → G2 → Data Analyst → Security Analyst → Hardware Engineer → Cooling Advisor → G3 → G4), the G3 checklist, the Security Analyst's and Hardware Engineer's reports, the signed recommendation, the forecast vs the chosen plan and (with Supabase) the case history.
+0. **Ask the agents**: pick a moment, a task (recommend / analyze / plan upgrades), optional failed sensors, equipment trips or a simulated cyber attack, and the agent mode. You see the answer, a swimlane trace of who did what (G1 → Supervisor → G2 → Data Analyst → Security Analyst → Hardware Engineer → Cooling Advisor → G3 → G4), the G3 checklist, the Security Analyst's and Hardware Engineer's reports, the signed recommendation, the forecast vs the chosen plan and (with Supabase) the case history.
 1. **Sensors**: floor map (heatmap of the 12 racks) for any day and time, the whole day as charts, a column dictionary and a CSV download.
 2. **Clean data**: the problems found in each sensor, raw vs cleaned, and the train/validation/test split.
 3. **Forecast**: error by horizon, forecast vs actual, feature importance, and **a what-if where you set a setpoint plan and see what the model predicts**.
@@ -488,6 +542,9 @@ Every tab starts with an **In short** box (the message in plain language) and, w
    limit, 4-week trend panels of the hidden faults, rack power from the PDUs, and the gateway's raw-register → decoded view of any device.
 8. **Security**: the attack surface, the closed-loop spoofing and replay attacks (true temperature, setpoint sent and the integrity
    residual), the integrity model's accuracy, a live prompt-screen playground, the STRIDE threat model and the protocol posture.
+9. **Data center**: the plant drawing with live values (hover for each unit's model, protocol and points), the power and heat
+   Sankey diagrams, the installed equipment and instruments with sources, and the upgrade advisor (editable CAPEX, hardware
+   alone vs with the AI, maintenance first).
 
 ## Limitations
 
@@ -527,6 +584,9 @@ predictive_cooling/
     gateway.py               sensor gateway: poll, decode, quality flags
     telemetry.py             builds the equipment historian (with injected hardware faults)
     diagnostics.py           limits, trends -> days to limit, N+1 capacity, cooling constraint
+    catalog.py               installed models, instruments and upgrade products (with sources)
+    flows.py                 electricity and heat balance at one moment (Sankey + plant drawing)
+    upgrades.py, advisor.py  upgrade options as plant changes, closed-loop study, payback ranking (S8)
   agents/                    agent layer (Supervisor, Data Analyst, Security Analyst, Hardware Engineer, Cooling Advisor)
     engine.py                LangGraph graph, G1/G2/G3, S5 compose, run_case()
     tools.py                 the tools agents may call (window ends at the case time)
@@ -536,10 +596,11 @@ predictive_cooling/
 tests/test_pipeline.py       tests for every step
 tests/test_hardware.py       gateway, historian, diagnostics, rule R5 and the Hardware Engineer
 tests/test_security.py       prompt screen, integrity model, replay, R6, signing, audit chain, attacks end to end
+tests/test_upgrades.py       catalog, flow balance, upgrade study and advisor, S8 in offline and scripted-Gemini cases
 tests/test_agents.py         agent, guardrail, scripted-Gemini and mock-server Claude tests
 tests/test_app.py            headless dashboard smoke tests (Streamlit AppTest)
 tests/test_storage.py        Supabase history (off without keys, failures never break a case)
-artifacts/bundle.pkl         trained models + test logs (committed for deployment)
+artifacts/bundle.pkl         trained models, test logs, attack runs and the upgrade study (committed for deployment)
 supabase/migrations/         SQL for the optional agent_cases table
 .streamlit/                  theme (config.toml) + secrets template
 docs/                        README images

@@ -21,6 +21,7 @@ import pandas as pd
 from langgraph.graph import END, START, StateGraph
 
 from .. import config as C
+from ..hardware import advisor
 from ..hardware.diagnostics import EquipmentWindow, summary_note
 from ..safety import RULES
 from ..security import commands as security_commands
@@ -156,6 +157,14 @@ def tool_impl(rt: Runtime, name: str, args=None):
             raise GuardError("EQUIPMENT_NOT_READ")
         out = rt.result.evidence["equipment"] = T.diagnose_equipment(rt.equipment)
         return out
+    if name == "evaluate_upgrades":
+        if rt.request.mode != "upgrade" or "equipment" not in rt.result.evidence:
+            raise GuardError("UPGRADES_NOT_IN_SCOPE")
+        try:
+            out = rt.result.evidence["upgrades"] = T.evaluate_upgrades(ctx, rt.result.evidence["equipment"])
+        except LookupError as exc:
+            raise GuardError(str(exc)) from exc
+        return out
     if name == "read_sensors":
         return T.read_sensors(win)
     if name == "inspect_data_quality":
@@ -265,7 +274,12 @@ def hardware_engineer(state):
         rt.activate("S6", "hardware_engineer")
         rt.call("read_equipment", "hardware_engineer", "S6", lambda: tool_impl(rt, "read_equipment"))
         diag = rt.call("diagnose_equipment", "hardware_engineer", "S6", lambda: tool_impl(rt, "diagnose_equipment"))
-        return rt.call("finish_equipment_check", "hardware_engineer", "S6", lambda: finish_hardware(rt, summary_note(diag)))
+        note = summary_note(diag)
+        if rt.request.mode == "upgrade":
+            rt.activate("S8", "hardware_engineer")
+            plan = rt.call("evaluate_upgrades", "hardware_engineer", "S8", lambda: tool_impl(rt, "evaluate_upgrades"))
+            note += " " + advisor.summary_note(plan)
+        return rt.call("finish_equipment_check", "hardware_engineer", "S6", lambda: finish_hardware(rt, note))
 
     report = rt.call("call_hardware_engineer", "supervisor", "S1", work)
     rt.event("supervisor", "receive_hardware_report", "completed", detail=f"{report['overall']} · constraint {report['constraint']}")
@@ -311,6 +325,8 @@ def validate(state):
         raise GuardError("EVIDENCE_CHANGED")
     trusted = verify_security(rt)
     constraint = verify_hardware(rt)
+    if trusted and rt.request.mode == "upgrade":         # an upgrade plan does not need live rack data to be ready
+        return verify_upgrades(rt)
     if not trusted:
         rt.result.status, rt.result.decision = "security_alert", "fallback"
         rt.result.reason_codes = rt.result.evidence["security"]["codes"]
@@ -391,6 +407,24 @@ def verify_security(rt: Runtime) -> bool:
     return sec["trusted"]
 
 
+def verify_upgrades(rt: Runtime):
+    """G3 for S8: recompute the plan from the stored study and the fresh diagnosis; the engineer's must match."""
+    if rt.ctx.upgrades is None:
+        raise GuardError("UPGRADE_STUDY_MISSING")
+    fresh = T.evaluate_upgrades(rt.ctx, rt.result.evidence["equipment"])
+    same = rt.result.evidence.get("upgrades") == fresh
+    rt.result.checks.append(Check(name="Upgrade plan recomputed from the closed-loop study", passed=same,
+                                  detail=f"{len(fresh['options'])} options, {len(fresh['maintenance_first'])} maintenance item(s)"))
+    if not same:
+        raise GuardError("UPGRADE_EVIDENCE_MISMATCH")
+    safe = all(o["minutes_over_27c"] == 0 for o in fresh["options"])
+    rt.result.checks.append(Check(name="Every option kept the racks ≤ 27 °C in simulation", passed=safe))
+    rt.result.evidence["upgrades"] = fresh
+    rt.result.status, rt.result.decision = "completed", "upgrade_plan"
+    rt.event("G3", "validate_upgrade_plan", detail=f"fastest payback: {fresh['options'][0]['title']}")
+    return {}
+
+
 def verify_hardware(rt: Runtime) -> str:
     """G3 for the hardware layer: re-poll every device, re-run the diagnosis, compare with what the engineer reported."""
     fresh = EquipmentWindow(rt.ctx.equipment, pd.Timestamp(rt.request.at), rt.policy.equipment_history_days,
@@ -427,6 +461,9 @@ def supervisor_finalize(state):
         r.explanation = (f"No AI recommendation: {', '.join(r.reason_codes)}. Safety rule R1 applies — return toward the proven "
                          f"fallback setpoint {rt.ctx.fallback_sp:g} °C ({r.recommended_setpoint:g} °C this step, max 1 °C per 15 min). "
                          f"{security} {hw} {mock}")
+    elif r.decision == "upgrade_plan":                 # rack data need not be ready for an upgrade plan
+        r.explanation = (f"Upgrade plan ({ev['upgrades']['basis']}). {advisor.summary_note(ev['upgrades'])} {hw} {security} "
+                         f"CAPEX values are budget assumptions; products are examples of each class. {mock}")
     elif r.status == "completed":
         s, hold = ev["state"], ev["forecast_hold"]
         risk = (f"Holding {hold['hold_setpoint_c']:g} °C for the next hour is forecast to peak at "

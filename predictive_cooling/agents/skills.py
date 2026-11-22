@@ -29,6 +29,7 @@ SKILLS = {
     "S5": Skill("S5", "supervisor", "Compose Recommendation", "s5-compose.md", ()),
     "S6": Skill("S6", "hardware_engineer", "Inspect Equipment Health", "s6-equipment.md",
                 ("read_equipment", "diagnose_equipment", "finish_equipment_check")),
+    "S8": Skill("S8", "hardware_engineer", "Plan Upgrades", "s8-upgrades.md", ("evaluate_upgrades",)),
     "S7": Skill("S7", "security_analyst", "Verify Data Integrity", "s7-security.md",
                 ("check_sensor_integrity", "audit_command_channel", "finish_security_review")),
 }

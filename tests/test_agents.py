@@ -36,7 +36,7 @@ def test_offline_recommend_runs_all_three_agents_and_g3(ctx):
     assert result.status == "completed" and result.decision in ("change", "no_change", "max_cooling")
     assert {"G1", "supervisor", "data_analyst", "security_analyst", "hardware_engineer", "cooling_advisor", "G2", "G3",
             "G4"} <= set(actors(result))
-    assert {e.skill_id for e in result.events if e.action == "skill_loaded"} == set(SKILLS)
+    assert {e.skill_id for e in result.events if e.action == "skill_loaded"} == set(SKILLS) - {"S8"}   # S8: upgrade mode only
     assert all(c.passed for c in result.checks)
     assert abs(result.recommended_setpoint - result.setpoint_in_use) <= 1
     assert result.evidence["mpc"]["plans_tried"] == 81

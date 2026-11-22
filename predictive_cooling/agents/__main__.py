@@ -7,6 +7,7 @@
     python -m predictive_cooling.agents --at "2026-04-29 05:30"                  # hardware warnings (no warmer)
     python -m predictive_cooling.agents --at "2026-04-21 00:30" --equipment-fault CRAH-1
     python -m predictive_cooling.agents --at "2026-04-21 02:00" --attack spoofing        # forged GPU-rack readings
+    python -m predictive_cooling.agents --at "2026-04-29 05:30" --mode upgrade          # maintenance + upgrade plan
 """
 import argparse
 import json
@@ -18,7 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--at", default="2026-04-21 00:30")
     parser.add_argument("--question", default=None)
-    parser.add_argument("--mode", choices=["recommend", "analyze"], default="recommend")
+    parser.add_argument("--mode", choices=["recommend", "analyze", "upgrade"], default="recommend")
     parser.add_argument("--agent", choices=["offline", "gemini", "claude"], default="offline")
     parser.add_argument("--fault", nargs="*", default=[], help="racks whose sensors fail, e.g. B5 B6")
     parser.add_argument("--equipment-fault", nargs="*", default=[], help="devices that trip, e.g. CRAH-1 CHWP-1")
