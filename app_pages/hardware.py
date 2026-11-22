@@ -9,8 +9,8 @@ from predictive_cooling.hardware import telemetry as hw_telemetry
 from predictive_cooling.hardware.diagnostics import RULES as HW_RULES, metrics
 from predictive_cooling.hardware.gateway import point_table
 from predictive_cooling.hardware.registry import CRAH_RATED_AIRFLOW_M3H, CRAH_RATED_KW, DEVICES, REGISTRY, TRIPPABLE
-from ui.common import (AXIS, CRIT, CTRL, EQUIP, INK2, MUTED, QTY, WARN, diagram, hardware_state, how_it_works, hw_limit, moment,
-                       note_metric, page_header, show, style)
+from ui.common import (AXIS, CRIT, CTRL, EQUIP, INK2, MUTED, QTY, WARN, diagram, hardware_state, how_it_works, hw_limit, kpi, kpi_row,
+                       moment, page_header, show, style)
 from ui.panels import SEVERITY_BADGE, findings_frame
 
 
@@ -76,15 +76,14 @@ hw_trips = st.pills("Simulate a trip", list(TRIPPABLE), selection_mode="multi", 
 snapshot, hw = hardware_state(str(hw_at), tuple(hw_trips or ()))
 cap = hw["capacity"]
 label, color = SEVERITY_BADGE[hw["overall"]]
-k = st.columns(5)
-k[0].metric("Devices answering", f"{hw['devices_answering']} / {hw['devices_polled']}", border=True,
-            help="A device that does not answer its poll is unknown, not healthy")
-k[1].metric("Equipment health", label, border=True)
-k[2].metric("Cooling constraint", hw["constraint"].replace("_", " "), border=True,
-            help="none · no raise (never warmer than now) · fallback (never warmer than the proven setpoint)")
-note_metric(k[3], "N+1 capacity", f"{cap['n_minus_1_capacity_kw']:.0f} kW", f"week peak {cap['peak_it_kw_7d']:.0f} kW",
-            help="If any one CRAH fails, can the other carry the highest IT load of the last 7 days?", border=True)
-k[4].metric("Findings", f"{len(hw['findings'])}", border=True)
+kpi_row(kpi("Devices answering", f"{hw['devices_answering']} / {hw['devices_polled']}",
+            help="A device that does not answer its poll is unknown, not healthy"),
+        kpi("Equipment health", label),
+        kpi("Cooling constraint", hw["constraint"].replace("_", " "),
+            help="none · no raise (never warmer than now) · fallback (never warmer than the proven setpoint)"),
+        kpi("N+1 capacity", f"{cap['n_minus_1_capacity_kw']:.0f} kW", f"week peak {cap['peak_it_kw_7d']:.0f} kW",
+            help="If any one CRAH fails, can the other carry the highest IT load of the last 7 days?"),
+        kpi("Findings", f"{len(hw['findings'])}"))
 
 st.markdown(f"**Devices at {hw_at:%a %d %b %H:%M}**")
 plant = [d for d in DEVICES if d.kind != "pdu"]

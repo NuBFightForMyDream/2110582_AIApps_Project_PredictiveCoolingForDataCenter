@@ -92,9 +92,30 @@ def hw_limit(fig, y, row, col, text, color):
                   annotation_font=dict(color=color, size=10.5), row=row, col=col)
 
 
-def note_metric(col, label, value, note, help=None, border=False):
-    """A metric whose small grey line is a note, not an up/down change."""
-    col.metric(label, value, note, delta_color="off", delta_arrow="off", help=help, border=border)
+def kpi(label, value, note=None, help=None, icon=None):
+    """One metric card for kpi_row(); `note` is a small grey line, not an up/down change."""
+    return dict(label=label, value=str(value), note=note, help=help, icon=icon)
+
+
+def _needed_width(k):
+    """Pixels a card needs so nothing is cut off (generous per-character widths for the theme's Inter font)."""
+    value = 23 * len(k["value"]) + 44
+    label = 8.6 * len(k["label"]) + 44 + (24 if k["help"] else 0) + (28 if k["icon"] else 0)
+    note = 8.6 * len(k["note"]) + 64 if k["note"] else 0
+    return int(max(value, label, note, 150))
+
+
+def kpi_row(*items, max_width=320, uniform=True):
+    """Metric cards in a row that wraps onto the next line when the page gets narrow (e.g. the sidebar opens),
+    instead of cutting values to "1,151 …". Cards share one width, wide enough for the longest of them; a card that
+    needs more than `max_width` (a long answer) gets its own width and does not widen the others. Use it at full page
+    width: inside a narrow column the cards would simply stack. `uniform=False` sizes every card to its own content."""
+    needs = [_needed_width(k) for k in items]
+    shared = max([n for n in needs if n <= max_width] or [max_width]) if uniform else 0
+    with st.container(horizontal=True, gap="small"):
+        for k, need in zip(items, needs):
+            st.metric(k["label"], k["value"], k["note"], delta_color="off", delta_arrow="off", help=k["help"], icon=k["icon"],
+                      border=True, width=max(shared, need), height="stretch")
 
 
 def signed(x, digits=1):

@@ -6,8 +6,8 @@ from plotly.subplots import make_subplots
 
 from predictive_cooling import config as C, forecast
 from predictive_cooling.mpc import MPC
-from ui.common import (AXIS, B, CTRL, INK, INK2, LIMIT, LOGS, MODEL, QTY, SURFACE, diagram, how_it_works, limit_line, moment,
-                       note_metric, page_header, show, style)
+from ui.common import (AXIS, B, CTRL, INK, INK2, LIMIT, LOGS, MODEL, QTY, SURFACE, diagram, how_it_works, kpi, kpi_row, limit_line,
+                       moment, page_header, show, style)
 
 
 page_header("Plan (MPC)", ":material/route:", "How the controller chooses a setpoint, at the moment picked in the sidebar.",
@@ -29,7 +29,6 @@ with how_it_works("81 plans, step by step"):
                 "thrown out, and the cheapest remaining plan wins. Only its first step is applied; 15 minutes later the "
                 "controller looks again with fresh sensor data (and corrects itself for its last forecast error).")
 ai_log = LOGS["normal", "ai"]
-c1, c2 = st.columns([1, 2])
 t = moment()
 d = t.date()
 row = ai_log.loc[t]
@@ -39,36 +38,30 @@ plans = mpc.evaluate_plans(state, row["setpoint_in_use"], row["bias_c"])
 safe = plans[plans["safe"]]
 best = safe["cost"].idxmin() if len(safe) else plans[plans["within_limits"]]["peak_guarded_c"].idxmin()
 chosen = plans.loc[best]
-with c1:
-    a, b = st.columns(2)
-    a.metric("Setpoint in use", f"{row['setpoint_in_use']:.0f} °C", border=True)
-    b.metric("Hottest inlet now", f"{row['measured_max_inlet_c']:.1f} °C", border=True)
-    a, b = st.columns(2)
-    a.metric("Safe plans", f"{len(safe)} of 81", border=True)
-    note_metric(b, "Apply now", f"{chosen['first_sp']:.0f} °C", "first step of the plan", border=True)
-    st.markdown(f"**Chosen plan** · {chosen['plan'].replace(' ', ' → ')} °C")
-    sent = row["command"]
-    if sent != chosen["first_sp"]:
-        st.info(f"The safety filter changed it to {sent:.0f} °C ({row['rules']}).")
-    st.caption(f"Feedback correction in use: {row['bias_c']:+.2f} °C · margins "
-               + ", ".join(f"{m:.2f}" for m in B["margins"]) + " °C at +15…60 min")
-with c2:
-    fig = go.Figure()
-    for flag, name, color in [(False, "Too hot (rejected)", AXIS), (True, "Safe", MODEL["gbm"])]:
-        part = plans[(plans["safe"] == flag) & plans["within_limits"]]
-        fig.add_scatter(x=part["peak_guarded_c"], y=part["energy_kwh"], mode="markers", name=name,
-                        marker=dict(size=9, color=color, line=dict(color=SURFACE, width=2)),
-                        customdata=part[["plan"]].to_numpy(),
-                        hovertemplate="plan %{customdata[0]} °C<br>peak %{x:.2f} °C (with margin)<br>%{y:.1f} kWh<extra></extra>")
-    fig.add_scatter(x=[chosen["peak_guarded_c"]], y=[chosen["energy_kwh"]], mode="markers+text", name="Chosen",
-                    marker=dict(size=18, color="rgba(0,0,0,0)", line=dict(color=INK, width=2.5)),
-                    text=[f"  chosen: {chosen['plan']}"], textposition="middle right", textfont=dict(color=INK, size=12),
-                    hoverinfo="skip")
-    fig.add_vline(x=C.INLET_LIMIT, line=dict(color=LIMIT, width=1.5), annotation_text="27 °C limit",
-                  annotation_font=dict(color=LIMIT, size=11))
-    fig.update_xaxes(title="predicted peak hottest inlet in the next hour, incl. safety margin (°C)")
-    fig.update_yaxes(title="predicted energy next hour (kWh)")
-    show(style(fig, height=360, title=f"81 plans at {t:%a %d %b %H:%M}", hover="closest"))
+kpi_row(kpi("Setpoint in use", f"{row['setpoint_in_use']:.0f} °C"), kpi("Hottest inlet now", f"{row['measured_max_inlet_c']:.1f} °C"),
+        kpi("Safe plans", f"{len(safe)} of 81"), kpi("Apply now", f"{chosen['first_sp']:.0f} °C", "first step"))
+st.markdown(f"**Chosen plan** · {chosen['plan'].replace(' ', ' → ')} °C")
+sent = row["command"]
+if sent != chosen["first_sp"]:
+    st.info(f"The safety filter changed it to {sent:.0f} °C ({row['rules']}).")
+st.caption(f"Feedback correction in use: {row['bias_c']:+.2f} °C · margins "
+           + ", ".join(f"{m:.2f}" for m in B["margins"]) + " °C at +15…60 min")
+fig = go.Figure()
+for flag, name, color in [(False, "Too hot (rejected)", AXIS), (True, "Safe", MODEL["gbm"])]:
+    part = plans[(plans["safe"] == flag) & plans["within_limits"]]
+    fig.add_scatter(x=part["peak_guarded_c"], y=part["energy_kwh"], mode="markers", name=name,
+                    marker=dict(size=9, color=color, line=dict(color=SURFACE, width=2)),
+                    customdata=part[["plan"]].to_numpy(),
+                    hovertemplate="plan %{customdata[0]} °C<br>peak %{x:.2f} °C (with margin)<br>%{y:.1f} kWh<extra></extra>")
+fig.add_scatter(x=[chosen["peak_guarded_c"]], y=[chosen["energy_kwh"]], mode="markers+text", name="Chosen",
+                marker=dict(size=18, color="rgba(0,0,0,0)", line=dict(color=INK, width=2.5)),
+                text=[f"  chosen: {chosen['plan']}"], textposition="middle right", textfont=dict(color=INK, size=12),
+                hoverinfo="skip")
+fig.add_vline(x=C.INLET_LIMIT, line=dict(color=LIMIT, width=1.5), annotation_text="27 °C limit",
+              annotation_font=dict(color=LIMIT, size=11))
+fig.update_xaxes(title="predicted peak hottest inlet in the next hour, incl. safety margin (°C)")
+fig.update_yaxes(title="predicted energy next hour (kWh)")
+show(style(fig, height=360, title=f"81 plans at {t:%a %d %b %H:%M}", hover="closest"))
 
 fig = make_subplots(rows=1, cols=2, subplot_titles=("Predicted hottest inlet for every plan (°C)", "Setpoint of the chosen plan (°C)"))
 future = [t + pd.Timedelta(minutes=15 * (i + 1)) for i in range(C.HORIZON)]

@@ -4,26 +4,24 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from predictive_cooling import config as C
-from ui.common import B, CTRL, HEAD, LOGS, NAMES, SC, limit_line, moment, page_header, show, signed, style
+from ui.common import B, CTRL, HEAD, LOGS, NAMES, SC, kpi, kpi_row, limit_line, moment, page_header, show, signed, style
 
 
 page_header("Results", ":material/bolt:", "Did it save energy, without overheating?",
             ["Three controllers run the same simulated weeks: **fixed** setpoint, a tuned **rule**, and the **AI**.",
              "Green = fixed, orange = rule, blue = AI. Lower energy is better; minutes above 27 °C must stay at 0."], art="results")
 ai = HEAD["ai"]
-k = st.columns(5)
-for col, label, value, note, icon, hlp in [
-    (k[0], "Cooling energy", signed(-HEAD['rule']['cooling_pct']), "vs tuned rule", ":material/eco:",
-     "AI vs the tuned rule-based controller, two test weeks, normal operation"),
-    (k[1], "Cooling energy", signed(-HEAD['fixed']['cooling_pct']), f"vs fixed {B['fixed_sp']:.0f} °C", ":material/eco:",
-     "AI vs the fixed setpoint, two test weeks, normal operation"),
-    (k[2], "Whole facility", signed(-HEAD['rule']['facility_pct'], 2), f"≈ {HEAD['rule']['yearly_thb'] / 1000:,.0f}k THB / year",
-     ":material/savings:", f"vs tuned rule. Includes the AI server ({C.AI_SERVER_KW:g} kW, 24/7). {C.ELECTRICITY_THB_PER_KWH:g} THB/kWh."),
-    (k[3], "Minutes > 27 °C", f"{ai['violation_minutes']:.0f}", f"hottest {ai['hottest_inlet_c']:.1f} °C", ":material/shield:",
-     "Minutes any rack inlet was above the 27 °C limit with the AI in control"),
-    (k[4], "Decision time", f"{ai['decision_ms_mean']:.0f} ms", "target < 10 s", ":material/speed:", None),
-]:
-    col.metric(label, value, note, delta_color="off", delta_arrow="off", help=hlp, border=True, icon=icon)
+kpi_row(
+    kpi("Cooling energy", signed(-HEAD['rule']['cooling_pct']), "vs tuned rule", icon=":material/eco:",
+        help="AI vs the tuned rule-based controller, two test weeks, normal operation"),
+    kpi("Cooling energy", signed(-HEAD['fixed']['cooling_pct']), f"vs fixed {B['fixed_sp']:.0f} °C", icon=":material/eco:",
+        help="AI vs the fixed setpoint, two test weeks, normal operation"),
+    kpi("Whole facility", signed(-HEAD['rule']['facility_pct'], 2), f"≈ {HEAD['rule']['yearly_thb'] / 1000:,.0f}k THB / year",
+        icon=":material/savings:",
+        help=f"vs tuned rule. Includes the AI server ({C.AI_SERVER_KW:g} kW, 24/7). {C.ELECTRICITY_THB_PER_KWH:g} THB/kWh."),
+    kpi("Minutes > 27 °C", f"{ai['violation_minutes']:.0f}", f"hottest {ai['hottest_inlet_c']:.1f} °C", icon=":material/shield:",
+        help="Minutes any rack inlet was above the 27 °C limit with the AI in control"),
+    kpi("Decision time", f"{ai['decision_ms_mean']:.0f} ms", "target < 10 s", icon=":material/speed:"))
 pick = st.segmented_control("Scenario", list(SC), default="normal", format_func=lambda s: SC[s].title, key="res_sc") or "normal"
 table = B["summary"].set_index(["scenario", "key"]).loc[pick].loc[["fixed", "rule", "ai"]]
 hours = len(LOGS[pick, "ai"]) * C.DT_H

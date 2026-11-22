@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from predictive_cooling import config as C
-from ui.common import B, CLEAN, LIMIT, MUTED, QTY, RAW, diagram, how_it_works, page_header, show, style
+from ui.common import B, CLEAN, LIMIT, MUTED, QTY, RAW, diagram, how_it_works, kpi, kpi_row, page_header, show, style
 
 
 page_header("Clean data", ":material/cleaning_services:", "Real logs are messy: fix them before anything learns from them.",
@@ -12,12 +12,11 @@ page_header("Clean data", ":material/cleaning_services:", "Real logs are messy: 
              "Four rules clean the data; then it is split **by time** so the model is tested on weeks it never saw."],
             art="cleaning")
 q = B["quality"]
-m = st.columns(5)
-m[0].metric("Readings on the grid", f"{len(CLEAN):,}", border=True)
-m[1].metric("Logger gaps", f"{q.attrs.get('gap_rows', 0)} rows", help="Missing timestamps put back on the 15-min grid", border=True)
-m[2].metric("Impossible values", f"{int(q['impossible'].sum())}", help="e.g. 85 °C or −40 °C from a bad packet", border=True)
-m[3].metric("Stuck-sensor readings", f"{int(q['stuck'].sum())}", help="Same exact value 6+ times in a row", border=True)
-m[4].metric("Short holes filled", f"{int(q['filled'].sum())}", help="Interpolated when the hole is ≤ 1 hour", border=True)
+kpi_row(kpi("Readings on the grid", f"{len(CLEAN):,}"),
+        kpi("Logger gaps", f"{q.attrs.get('gap_rows', 0)} rows", help="Missing timestamps put back on the 15-min grid"),
+        kpi("Impossible values", f"{int(q['impossible'].sum())}", help="e.g. 85 °C or −40 °C from a bad packet"),
+        kpi("Stuck-sensor readings", f"{int(q['stuck'].sum())}", help="Same exact value 6+ times in a row"),
+        kpi("Short holes filled", f"{int(q['filled'].sum())}", help="Interpolated when the hole is ≤ 1 hour"))
 with how_it_works("The four cleaning rules and the split"):
     diagram("""
     flowchart LR

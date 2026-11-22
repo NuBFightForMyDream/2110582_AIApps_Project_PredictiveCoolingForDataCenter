@@ -34,7 +34,7 @@ Results on the two test weeks the AI never trained on (20 Apr – 3 May 2026), s
 ## Quick start
 
 Requires Python 3.11+. Developed on 3.14; a fresh 3.13 environment built only from `requirements.txt` loads the committed
-study and passes all 117 tests. `requirements.txt` pins exact versions because the committed `artifacts/bundle.pkl` is only
+study and passes all tests (117 at the time). `requirements.txt` pins exact versions because the committed `artifacts/bundle.pkl` is only
 reused when scikit-learn matches; otherwise the first start rebuilds it (2–5 minutes).
 
 ```bash
@@ -88,7 +88,7 @@ Regenerate the data, the study or the README figures (all deterministic; seeds a
 .venv/bin/pip install -r requirements-dev.txt && .venv/bin/python scripts/make_figures.py   # docs/*.png
 ```
 
-Tests (117 tests including headless smoke tests of every dashboard page, about 2 minutes):
+Tests (118 tests including headless smoke tests of every dashboard page, about 2 minutes):
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -552,7 +552,7 @@ stored study.
 A multipage app with a menu at the top. Every page opens with a short header (what the page answers, three plain-language
 points and a small illustration in the cover's style); diagrams and method notes sit in a collapsed **How it works**.
 The **moment** in the sidebar (any 15 minutes of the two test weeks, with *Jump to* shortcuts such as *GPU batch about to
-start* or *Hardware warnings*) drives every page, and each page computes only what it shows.
+start* or *Hardware warnings*) drives every page, and each page computes only what it shows. Metric cards wrap onto the next row instead of being cut off when the page narrows.
 
 | Menu | Page | What you see |
 |---|---|---|

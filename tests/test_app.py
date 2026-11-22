@@ -52,3 +52,25 @@ def test_equipment_health_follows_the_sidebar_moment(preset, constraint):
 def test_live_plant_handles_a_device_that_does_not_answer():
     _, metrics = render("live_plant", moment_day=dt.date(2026, 4, 26), moment_time="15:00")
     assert metrics["PUE"].startswith("1.")
+
+
+def test_every_metric_card_has_a_width_that_fits_its_text(monkeypatch):
+    """Metrics must go through ui.common.kpi_row: a fixed width computed from their text inside a wrapping row.
+    A metric stretched across a narrow column cuts its value ("1,151 …") when the sidebar opens."""
+    import streamlit as st
+    from ui.common import _needed_width, kpi
+    widths = []
+    original = st.metric                         # bound to the main container when Streamlit is imported
+
+    def recording(label, value, delta=None, *args, **kwargs):
+        widths.append((label, str(value), delta, kwargs.get("help"), kwargs.get("icon"), kwargs.get("width")))
+        return original(label, value, delta, *args, **kwargs)
+    monkeypatch.setattr(st, "metric", recording)
+    for page in PAGES:
+        render(page)
+    assert widths
+    pages = sorted((Path(APP).parent / "app_pages").glob("*.py"))
+    assert not [f.name for f in pages if ".metric(" in f.read_text()], "pages must use ui.common.kpi_row, not .metric()"
+    for label, value, note, help_, icon, width in widths:
+        assert isinstance(width, int), f"{label!r} is not in a kpi_row"
+        assert width >= _needed_width(kpi(label, value, note, help_, icon)), f"{label!r} = {value!r} is too narrow"
