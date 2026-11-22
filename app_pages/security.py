@@ -6,8 +6,8 @@ from plotly.subplots import make_subplots
 from predictive_cooling.security.integrity import REPEAT_LIMIT_C, SINGLE_LIMIT_C
 from predictive_cooling.security.posture import PROTOCOLS, STRIDE, device_posture
 from predictive_cooling.security.prompt_guard import screen_question
-from ui.common import (B, CRIT, CTRL, INK2, LIMIT, LOGS, NAMES, SEC, WARN, diagram, how_it_works, hw_limit, limit_line,
-                       note_metric, page_header, show, style)
+from ui.common import (B, CRIT, CTRL, INK2, LIMIT, LOGS, NAMES, SEC, WARN, diagram, how_it_works, hw_limit, kpi, kpi_row,
+                       limit_line, page_header, show, style)
 
 
 PROMPT_EXAMPLES = [
@@ -57,8 +57,9 @@ with c1:
         width="stretch")
 with c2:
     blind, guarded = table.loc["ai_no_integrity"], table.loc["ai"]
-    note_metric(st, "Overheating prevented", f"{blind['violation_minutes'] - guarded['violation_minutes']:.0f} min",
-                f"AI without the check: {blind['violation_minutes']:.0f} min > 27 °C")
+    kpi_row(kpi("Overheating prevented", f"{blind['violation_minutes'] - guarded['violation_minutes']:.0f} min",
+                f"{blind['violation_minutes']:.0f} → {guarded['violation_minutes']:.0f} min > 27 °C",
+                help="Minutes above 27 °C: the AI without the integrity check → the AI with it"))
     st.caption("Fixed 20 °C never looks at the racks, so a lie cannot move it. The rule-based controller and the AI without "
                "the integrity check believe the cooler readings, run warmer and overheat the real racks.")
 start, hours = pd.Timestamp(scen.highlight[0][0]), scen.highlight[0][1]
@@ -86,7 +87,13 @@ show(style(fig, height=560, title=f"Zoom on the first attack · {start:%a %d %b}
 
 integ = B["integrity"].validation
 st.subheader("The integrity model", icon=":material/model_training:")
-c1, c2 = st.columns([1, 1.25])
+kpi_row(kpi("Residual spread", f"{integ['test']['residual_std_c']:.2f} °C", help="Std of reported − expected, test weeks"),
+        kpi("False alarms", f"{integ['validation']['false_alarms'] + integ['test']['false_alarms']}",
+            f"{integ['validation']['readings'] + integ['test']['readings']:,} readings",
+            help="Validation + test weeks, data the model never trained on"),
+        kpi("Deepest honest dip", f"{min(integ['validation']['min_residual_c'], integ['test']['min_residual_c']):.2f} °C",
+            help="Lowest residual on unseen weeks; the alarm limits sit below it"))
+c1, c2 = st.columns([1, 1.25], vertical_alignment="center")
 with c1:
     diagram("""
 flowchart LR
@@ -99,12 +106,6 @@ D -- yes --> U["Untrusted → R6"]:::guard
 D -- no --> T["Trusted"]:::ok
 """, alt="Integrity model: supply air and rack PDU power predict the inlet; a reported inlet far below the prediction is untrusted")
 with c2:
-    k = st.columns(3)
-    k[0].metric("Residual spread", f"{integ['test']['residual_std_c']:.2f} °C", border=True, help="Std of reported − expected, test weeks")
-    k[1].metric("False alarms", f"{integ['validation']['false_alarms'] + integ['test']['false_alarms']}", border=True,
-                help=f"{integ['validation']['readings'] + integ['test']['readings']:,} readings in the validation + test weeks")
-    k[2].metric("Deepest honest dip", f"{min(integ['validation']['min_residual_c'], integ['test']['min_residual_c']):.2f} °C",
-                border=True, help="Lowest residual on unseen weeks; the alarm limits sit below it")
     st.caption("Inputs: supply air now and 15/30/45 min ago, rack PDU power over the same lags (the room's ~25-minute "
                "thermal lag). Only *cooler than physics* raises an alarm: that is the lie that makes an AI run warmer. To "
                "pass, an attacker would have to forge the separate PDU network too. Limits of this check: a forgery smaller "

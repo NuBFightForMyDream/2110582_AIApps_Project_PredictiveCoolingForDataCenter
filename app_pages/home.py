@@ -2,7 +2,7 @@
 import streamlit as st
 
 from predictive_cooling.hardware import advisor as hw_advisor
-from ui.common import B, HEAD, diagram, how_it_works, signed
+from ui.common import B, HEAD, diagram, how_it_works, kpi, kpi_row, signed
 
 ai = HEAD["ai"]
 summary = B["summary"].set_index(["scenario", "key"])
@@ -10,19 +10,12 @@ blind = summary.loc[("spoofing_attack", "ai_no_integrity"), "violation_minutes"]
 guarded = summary.loc[("spoofing_attack", "ai"), "violation_minutes"]
 package = next(o for o in hw_advisor.plan(B["upgrades"])["options"] if o["key"] == "package")
 
-left, right = st.columns([1.1, 1], gap="large", vertical_alignment="center")
+left, right = st.columns([1.2, 1], gap="large", vertical_alignment="center")
 with left:
     st.title("Predictive cooling for a data center", icon=":material/ac_unit:")
     st.markdown("Server rooms waste electricity by cooling more than they need. This project **forecasts the next hour** and "
                 "picks the warmest cooling setpoint that still keeps every rack below **27 °C**. Five AI agents check the "
                 "data, the equipment and the options first, and explain the decision.")
-    a, b, c = st.columns(3)
-    a.metric("Cooling energy", signed(-HEAD["rule"]["cooling_pct"]), "vs a tuned rule", delta_color="off", delta_arrow="off",
-             border=True, help="Two test weeks the AI never trained on, normal operation")
-    b.metric("Minutes > 27 °C", f"{ai['violation_minutes']:.0f}", "in two test weeks", delta_color="off", delta_arrow="off",
-             border=True)
-    c.metric("Under attack", f"{guarded:.0f} min", f"vs {blind:.0f} min without the check", delta_color="off", delta_arrow="off",
-             border=True, help="Minutes above 27 °C when an attacker forges the GPU racks' readings")
     with st.container(horizontal=True):
         st.page_link("app_pages/agents.py", label="Ask the agents", icon=":material/smart_toy:")
         st.page_link("app_pages/live_plant.py", label="See the live plant", icon=":material/factory:")
@@ -30,6 +23,14 @@ with left:
 with right:
     st.image("CoverPage.png", width="stretch", alt="Cover: a cooling unit blows cold air through server racks while a friendly "
              "robot watches a forecast chart")
+kpi_row(kpi("Cooling energy", signed(-HEAD["rule"]["cooling_pct"]), "vs tuned rule",
+            help="AI vs a tuned rule-based controller, two test weeks the AI never trained on"),
+        kpi("Minutes > 27 °C", f"{ai['violation_minutes']:.0f}", "two test weeks"),
+        kpi("Under attack", f"{guarded:.0f} min", f"{blind:.0f} unchecked",
+            help=f"Minutes above 27 °C when an attacker forges the GPU racks' readings: {guarded:.0f} with the integrity "
+                 f"check, {blind:.0f} without it"),
+        kpi("All upgrades", f"−{package['saved_facility_pct']:.1f} %", "facility energy",
+            help="Every hardware option together, with the AI, measured in closed loop (Upgrade advisor)"))
 st.caption("All data is a mock 12-rack room from a physics model. Nothing here controls real equipment.")
 
 st.subheader("The idea in 30 seconds", icon=":material/lightbulb:")

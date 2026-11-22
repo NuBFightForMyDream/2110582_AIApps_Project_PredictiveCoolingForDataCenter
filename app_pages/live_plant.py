@@ -8,7 +8,7 @@ from predictive_cooling import config as C
 from predictive_cooling.hardware.catalog import INSTALLED, INSTRUMENTS
 from predictive_cooling.hardware.flows import balance
 from predictive_cooling.hardware.registry import DEVICES, REGISTRY
-from ui.common import AXIS, CLEAN, EQUIP, FONT, INK, INK2, MUTED, SURFACE, moment, page_header, show, style
+from ui.common import AXIS, CLEAN, EQUIP, FONT, INK, INK2, MUTED, SURFACE, kpi, kpi_row, moment, page_header, show, style
 
 
 FLOW = {"chw_supply": "#2a78d6", "chw_return": "#d03b3b", "condenser": "#eb6834", "power": "#6250d6",
@@ -200,15 +200,14 @@ if room is None or eq_row is None or room[C.INLET_COLS + ["facility_kw"]].isna()
     st.warning("No complete reading at this moment (logger gap). Pick another time.")
 else:
     bal = balance(room, eq_row)
-    k = st.columns(5)
-    k[0].metric("PUE", f"{bal['kpi']['pue']:.2f}", border=True, help="Facility power ÷ IT power")
-    k[1].metric("Cooling per IT kW", f"{bal['kpi']['cooling_per_it']:.2f}", border=True,
-                help="Cooling power ÷ IT power: the part of PUE the AI and the upgrades attack")
-    k[2].metric("Chiller", f"{bal['kpi']['kw_per_tr']:.2f} kW/TR", border=True,
-                help=f"COP {bal['kpi']['cop']:.2f}; 1 TR = 3.517 kW of cooling")
-    k[3].metric("Chilled-water ΔT", f"{bal['kpi']['chw_delta_c']:.1f} °C", border=True,
-                help="Return − supply; a low ΔT means pumping more water than the load needs")
-    k[4].metric("Hottest inlet", f"{bal['kpi']['hottest_inlet_c']:.1f} °C", border=True, help="ASHRAE recommended ≤ 27 °C")
+    kpi_row(kpi("PUE", f"{bal['kpi']['pue']:.2f}", help="Facility power ÷ IT power"),
+            kpi("Cooling ÷ IT", f"{bal['kpi']['cooling_per_it']:.2f}",
+                help="Cooling power ÷ IT power: the part of PUE the AI and the upgrades attack"),
+            kpi("Chiller kW/TR", f"{bal['kpi']['kw_per_tr']:.2f}", f"COP {bal['kpi']['cop']:.2f}",
+                help="1 TR = 3.517 kW of cooling; lower is better"),
+            kpi("Chilled-water ΔT", f"{bal['kpi']['chw_delta_c']:.1f} °C",
+                help="Return − supply; a low ΔT means pumping more water than the load needs"),
+            kpi("Hottest inlet", f"{bal['kpi']['hottest_inlet_c']:.1f} °C", help="ASHRAE recommended ≤ 27 °C"))
     show(plant_schematic(room, eq_row, bal))
     st.caption(f"{dc_at:%a %d %b %H:%M}. Arrows show direction; rack colour = inlet temperature (blue cool → red hot); the red "
                "arrow at the row end is hot air recirculating around B6, the hot spot that containment fixes.")

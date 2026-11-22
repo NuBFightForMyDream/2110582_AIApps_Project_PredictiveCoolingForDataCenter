@@ -16,8 +16,8 @@ from predictive_cooling.security import commands as security_commands
 from predictive_cooling.security.attacks import ATTACKS, ATTACK_TITLES
 from predictive_cooling.security.ratelimit import SlidingWindowLimiter
 from predictive_cooling.security.signing import CommandVerifier
-from ui.common import (B, CTRL, EQUIP, GRID, LIMIT, MUTED, SURFACE, diagram, how_it_works, limit_line, moment, page_header,
-                       show, style)
+from ui.common import (B, CTRL, EQUIP, GRID, LIMIT, MUTED, SURFACE, diagram, how_it_works, kpi, kpi_row, limit_line, moment,
+                       page_header, show, style)
 from ui.panels import hardware_panel, upgrade_frame
 
 
@@ -101,13 +101,13 @@ def trace_chart(result):
 def agent_case_panel():
     """Controls, run and results of one case. A fragment: Run case reruns only this part, not the whole page."""
     at = moment()
-    c1, c2 = st.columns([1.25, 1], vertical_alignment="bottom")
-    mode = c1.segmented_control("Task", ["recommend", "analyze", "upgrade"], default="recommend",
-                                format_func={"recommend": "Recommend a setpoint", "analyze": "Analyze only",
-                                             "upgrade": "Plan upgrades"}.get) or "recommend"
-    agent_mode = c2.segmented_control("Agent mode", ["offline", "gemini", "claude"], default="offline",
-                                      format_func={"offline": "Offline roles", "gemini": "Gemini",
-                                                   "claude": "Claude Haiku"}.get) or "offline"
+    with st.container(horizontal=True, gap="large"):         # wraps onto two rows when the page is narrow
+        mode = st.segmented_control("Task", ["recommend", "analyze", "upgrade"], default="recommend",
+                                    format_func={"recommend": "Recommend a setpoint", "analyze": "Analyze only",
+                                                 "upgrade": "Plan upgrades"}.get) or "recommend"
+        agent_mode = st.segmented_control("Agent mode", ["offline", "gemini", "claude"], default="offline",
+                                          format_func={"offline": "Offline roles", "gemini": "Gemini",
+                                                       "claude": "Claude Haiku"}.get) or "offline"
     key_name = {"gemini": "GEMINI_API_KEY", "claude": "ANTHROPIC_API_KEY"}.get(agent_mode)
     st.caption(f":material/schedule: **{at:%a %d %b %H:%M}** (change the moment in the sidebar) · Offline = fixed role "
                "procedures, no LLM, instant. Gemini and Claude Haiku = real function calling, about 19 model calls, at most "
@@ -169,12 +169,10 @@ def agent_case_panel():
                     "fallback": f"Fallback → {result.recommended_setpoint:g} °C" if result.recommended_setpoint is not None else "",
                     "analysis_only": "Analysis only", "upgrade_plan": "Upgrade plan",
                     "unavailable": "No answer released"}[result.decision]
-        m = st.columns(5)
-        m[0].metric("Agents' answer", headline)
-        m[1].metric("Status", result.status.replace("_", " "))
-        m[2].metric("Setpoint in use", f"{result.setpoint_in_use:g} °C" if result.setpoint_in_use is not None else "—")
-        m[3].metric("Tool calls (G2)", f"{result.tool_calls}", help="Includes the two delegations")
-        m[4].metric("Model calls", f"{result.model_calls}", help="0 in offline mode")
+        kpi_row(kpi("Agents' answer", headline), kpi("Status", result.status.replace("_", " ")),
+                kpi("Setpoint in use", f"{result.setpoint_in_use:g} °C" if result.setpoint_in_use is not None else "—"),
+                kpi("Tool calls (G2)", f"{result.tool_calls}", help="Includes the delegations to each agent"),
+                kpi("Model calls", f"{result.model_calls}", help="0 in offline mode"), uniform=False)
         (st.success if result.status == "completed" else st.warning)(result.explanation)
         left, right = st.columns([1.5, 1])
         with left:

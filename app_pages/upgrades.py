@@ -7,7 +7,7 @@ from predictive_cooling import config as C
 from predictive_cooling.hardware import advisor as hw_advisor
 from predictive_cooling.hardware.catalog import GRID_EMISSION_SOURCE, GRID_EMISSION_T_PER_MWH
 from predictive_cooling.hardware.upgrades import UPGRADES
-from ui.common import B, CTRL, diagram, hardware_state, how_it_works, moment, note_metric, page_header, show, style
+from ui.common import B, CTRL, diagram, hardware_state, how_it_works, kpi, kpi_row, moment, page_header, show, style
 from ui.panels import upgrade_frame
 
 
@@ -36,7 +36,11 @@ dc_at = moment()
 study = B["upgrades"]
 capex_frame = pd.DataFrame([{"Option": u.title, "Budget low (THB)": u.capex_thb[0], "Budget high (THB)": u.capex_thb[1],
                              "CAPEX used (THB)": sum(u.capex_thb) / 2} for u in UPGRADES.values()], index=list(UPGRADES))
-c1, c2 = st.columns([1.05, 1])
+base = hw_advisor.plan(study)["baseline"]                        # today's AI on today's room (no CAPEX needed)
+kpi_row(kpi("Facility today", f"{base['facility_kwh_yr'] / 1000:,.0f}", "MWh per year"),
+        kpi("Cooling today", f"{base['cooling_kwh_yr'] / 1000:,.0f}", "MWh per year"),
+        kpi("PUE today", f"{base['pue']:.3f}", "today's AI"))
+c1, c2 = st.columns([1.6, 1], vertical_alignment="center")
 with c1:
     st.caption("CAPEX are budget assumptions for this 12-rack room. Put your own quotes in the last column; "
                 "savings, payback and the ranking update.")
@@ -46,14 +50,12 @@ with c1:
 capex = dict(zip(UPGRADES, edited["CAPEX used (THB)"].astype(float)))
 diag_now = hardware_state(str(dc_at))[1]                         # findings at the sidebar moment
 advice = hw_advisor.plan(study, diag_now, capex)
-base = advice["baseline"]
 with c2:
-    k = st.columns(3)
-    k[0].metric("Today: facility", f"{base['facility_kwh_yr'] / 1000:,.0f} MWh/yr", border=True)
-    k[1].metric("Today: cooling", f"{base['cooling_kwh_yr'] / 1000:,.0f} MWh/yr", border=True)
-    k[2].metric("Today: PUE", f"{base['pue']:.3f}", border=True)
     quick = advice["options"][0]
-    note_metric(st, "Fastest payback", quick["title"], f"{quick['payback_years']:g} years · {quick['saved_thb_yr']:,.0f} THB/yr")
+    with st.container(border=True):
+        st.markdown(f":material/bolt: **Fastest payback** · {quick['title']}")
+        st.markdown(f"**{quick['payback_years']:g} years** · {quick['saved_thb_yr']:,.0f} THB a year · "
+                    f"{quick['saved_tco2_yr']:g} tCO₂ a year")
 st.dataframe(upgrade_frame(advice), hide_index=True, width="stretch",
              column_config={"Saves kWh/yr": st.column_config.NumberColumn(format="%d"),
                             "THB/yr": st.column_config.NumberColumn(format="%d"),

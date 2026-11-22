@@ -6,7 +6,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from predictive_cooling import config as C
-from ui.common import AXIS, CLEAN, INK, INK2, MUTED, QTY, RAW, TIMES, limit_line, moment, note_metric, page_header, show, style
+from ui.common import AXIS, CLEAN, INK, INK2, MUTED, QTY, RAW, TIMES, kpi, kpi_row, limit_line, moment, page_header, show, style
 
 
 def floor_map(values: dict, title):
@@ -47,20 +47,12 @@ reading = CLEAN.loc[ts] if ts in CLEAN.index else None
 if reading is None or pd.isna(reading["max_inlet_c"]):
     st.warning("No complete reading at this time (logger gap). Try another time.", icon=":material/signal_disconnected:")
 else:
-    left, right = st.columns([1, 2.1], vertical_alignment="center")
-    with left:
-        a, b = st.columns(2)
-        a.metric("IT power", f"{reading['it_power_kw']:.0f} kW", border=True)
-        b.metric("Cooling power", f"{reading['cooling_kw']:.0f} kW", border=True)
-        a, b = st.columns(2)
-        a.metric("PUE", f"{reading['pue']:.2f}", help="Facility power ÷ IT power. 1.0 would be perfect.", border=True)
-        b.metric("Outdoor", f"{reading['outdoor_temp_c']:.1f} °C", border=True)
-        a, b = st.columns(2)
-        a.metric("Setpoint", f"{reading['crah_setpoint_c']:.0f} °C", help="Supply-air setpoint: the one knob the AI controls",
-                 border=True)
-        note_metric(b, "Hottest inlet", f"{reading['max_inlet_c']:.1f} °C", f"rack {reading['hottest_rack']}", border=True)
-    with right:
-        show(floor_map({r: reading[f"inlet_{r}_c"] for r in C.RACKS}, f"Rack inlet temperatures · {ts:%a %d %b %H:%M}"))
+    kpi_row(kpi("IT power", f"{reading['it_power_kw']:.0f} kW"), kpi("Cooling power", f"{reading['cooling_kw']:.0f} kW"),
+            kpi("PUE", f"{reading['pue']:.2f}", help="Facility power ÷ IT power. 1.0 would be perfect."),
+            kpi("Outdoor", f"{reading['outdoor_temp_c']:.1f} °C"),
+            kpi("Setpoint", f"{reading['crah_setpoint_c']:.0f} °C", help="Supply-air setpoint: the one knob the AI controls"),
+            kpi("Hottest inlet", f"{reading['max_inlet_c']:.1f} °C", f"rack {reading['hottest_rack']}"))
+    show(floor_map({r: reading[f"inlet_{r}_c"] for r in C.RACKS}, f"Rack inlet temperatures · {ts:%a %d %b %H:%M}"))
 
 day_frame = CLEAN.loc[str(day)]
 fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.07, row_heights=[0.42, 0.33, 0.25],

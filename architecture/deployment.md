@@ -19,7 +19,7 @@ Template: `.streamlit/secrets.toml.example`. On Streamlit Community Cloud pick `
 | Run the app | `.venv/bin/python -m predictive_cooling` |
 | Ask the agents | `.venv/bin/python -m predictive_cooling.agents --at "2026-04-21 00:30" [--mode analyze\|upgrade] [--fault B5 B6] [--equipment-fault CRAH-1] [--attack spoofing]` |
 | Rebuild data / study | `python -m predictive_cooling.dataset`, `python -m predictive_cooling.hardware`, `python -m predictive_cooling.pipeline` |
-| Tests | `.venv/bin/python -m pytest -q` (117 tests, ≈ 2 min) |
+| Tests | `.venv/bin/python -m pytest -q` (118 tests, ≈ 2 min) |
 | README figures | `pip install -r requirements-dev.txt`, then `python scripts/make_figures.py` |
 
 `tests/test_storage.py` checks that the SQL check constraints accept every task and agent mode the code can save.
