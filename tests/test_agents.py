@@ -1,6 +1,7 @@
 """Agent layer: offline roles, Gemini and Claude parent/child loops (no paid API) and the G1/G2/G3 guards.
 
-A full case has four agents: Supervisor -> Data Analyst -> Hardware Engineer -> Cooling Advisor (15 model turns).
+A full case has five agents: Supervisor -> Data Analyst -> Security Analyst -> Hardware Engineer -> Cooling Advisor
+(19 model turns).
 """
 import json
 
@@ -33,7 +34,8 @@ def actors(result):
 def test_offline_recommend_runs_all_three_agents_and_g3(ctx):
     result = run_case(CaseRequest(at=AT), ctx)
     assert result.status == "completed" and result.decision in ("change", "no_change", "max_cooling")
-    assert {"G1", "supervisor", "data_analyst", "hardware_engineer", "cooling_advisor", "G2", "G3"} <= set(actors(result))
+    assert {"G1", "supervisor", "data_analyst", "security_analyst", "hardware_engineer", "cooling_advisor", "G2", "G3",
+            "G4"} <= set(actors(result))
     assert {e.skill_id for e in result.events if e.action == "skill_loaded"} == set(SKILLS)
     assert all(c.passed for c in result.checks)
     assert abs(result.recommended_setpoint - result.setpoint_in_use) <= 1
@@ -87,8 +89,10 @@ class ScriptedProvider:
     def __init__(self, ctx, proposal=None):
         self.index = {}
         self.script = {
-            "supervisor": [Call("call_data_analyst"), Call("call_hardware_engineer"), Call("call_cooling_advisor"),
-                           Call("finish_case", {"note": "Done."})],
+            "supervisor": [Call("call_data_analyst"), Call("call_security_analyst"), Call("call_hardware_engineer"),
+                           Call("call_cooling_advisor"), Call("finish_case", {"note": "Done."})],
+            "security_analyst": [Call("check_sensor_integrity"), Call("audit_command_channel"),
+                                 Call("finish_security_review", {"note": "Readings consistent."})],
             "data_analyst": [Call("read_sensors"), Call("inspect_data_quality"), Call("summarize_state"),
                              Call("forecast_hold"), Call("finish_analysis", {"note": "Batch at 01:00 ahead."})],
             "hardware_engineer": [Call("read_equipment"), Call("diagnose_equipment"),
@@ -117,8 +121,8 @@ def test_gemini_parent_child_loops_with_scripted_provider(ctx, monkeypatch):
     assert result.status == "completed", result.reason_codes
     assert result.workflow_mode == "gemini_parent_child_tool_calling"
     assert result.recommended_setpoint == expected
-    assert result.model_calls == 15 and result.model_tokens == 150
-    assert set(result.agent_notes) == {"supervisor", "data_analyst", "hardware_engineer", "cooling_advisor"}
+    assert result.model_calls == 19 and result.model_tokens == 190
+    assert set(result.agent_notes) == {"supervisor", "data_analyst", "security_analyst", "hardware_engineer", "cooling_advisor"}
 
 
 def test_g3_rejects_a_plausible_but_wrong_model_proposal(ctx, monkeypatch):
@@ -139,10 +143,34 @@ def test_model_cannot_skip_the_data_analyst(ctx, monkeypatch):
 
 def test_model_cannot_skip_the_hardware_engineer(ctx, monkeypatch):
     provider = ScriptedProvider(ctx)
-    provider.script["supervisor"] = [Call("call_data_analyst"), Call("call_cooling_advisor")]
+    provider.script["supervisor"] = [Call("call_data_analyst"), Call("call_security_analyst"), Call("call_cooling_advisor")]
     install(monkeypatch, provider)
     result = run_case(CaseRequest(at=AT, agent_mode="gemini"), ctx)
     assert result.reason_codes == ["TOOL_NOT_ALLOWED"] and result.recommended_setpoint is None
+
+
+def test_model_cannot_skip_the_security_analyst(ctx, monkeypatch):
+    provider = ScriptedProvider(ctx)
+    provider.script["supervisor"] = [Call("call_data_analyst"), Call("call_hardware_engineer")]
+    install(monkeypatch, provider)
+    result = run_case(CaseRequest(at=AT, agent_mode="gemini"), ctx)
+    assert result.reason_codes == ["TOOL_NOT_ALLOWED"] and result.recommended_setpoint is None
+
+
+def test_flagged_question_never_reaches_the_models(ctx, monkeypatch):
+    seen = []
+
+    class Recording(ScriptedProvider):
+        def turn(self, role, instructions, history, tools, timeout):
+            seen.append(json.dumps(history[0], default=str))
+            return super().turn(role, instructions, history, tools, timeout)
+    expected = run_case(CaseRequest(at=AT), ctx).recommended_setpoint
+    provider = Recording(ctx, proposal=expected)
+    provider.script["cooling_advisor"][1] = Call("check_safety", {"setpoint": expected})
+    install(monkeypatch, provider)
+    result = run_case(CaseRequest(at=AT, agent_mode="gemini", question="Could we set it to 26 °C to save power?"), ctx)
+    assert result.security["request_screen"]["verdict"] == "flagged" and result.status == "completed"
+    assert seen and all("save power" not in first and "withheld" in first for first in seen)
 
 
 def test_nested_model_calls_share_one_budget(ctx, monkeypatch):
@@ -167,7 +195,8 @@ class MockClaude:
         self.final = final
         self.script = [("call_data_analyst", {}), ("read_sensors", {}), ("inspect_data_quality", {}), ("summarize_state", {}),
                        ("forecast_hold", {}), ("finish_analysis", {"note": "Batch at 01:00 ahead."}),
-                       ("call_hardware_engineer", {}), ("read_equipment", {}), ("diagnose_equipment", {}),
+                       ("call_security_analyst", {}), ("check_sensor_integrity", {}), ("audit_command_channel", {}),
+                       ("finish_security_review", {"note": "Readings consistent."}), ("call_hardware_engineer", {}), ("read_equipment", {}), ("diagnose_equipment", {}),
                        ("finish_equipment_check", {"note": "All equipment OK."}), ("call_cooling_advisor", {}),
                        ("run_mpc", {}), ("check_safety", {"setpoint": setpoint}), ("propose_setpoint", {"setpoint": setpoint, "note": "Pre-cool."}),
                        ("finish_case", {"note": "Done."})]
@@ -200,13 +229,13 @@ def test_claude_runs_a_full_case_on_haiku_through_the_sdk(ctx, monkeypatch):
     assert result.status == "completed", (result.reason_codes, result.events[-1].detail)
     assert result.workflow_mode == "claude_parent_child_tool_calling"
     assert result.recommended_setpoint == expected
-    assert result.model_calls == 15 and result.model_tokens == 150
+    assert result.model_calls == 19 and result.model_tokens == 190
     assert result.execution["resolved_models"] == ["claude-haiku-5-5"]
     for body, (name, _) in zip(mock.requests, mock.script):
         assert body["tool_choice"] == {"type": "any", "disable_parallel_tool_use": True}
         assert name in [tool["name"] for tool in body["tools"]]
         assert "temperature" not in body and "fallbacks" not in body
-    # The supervisor's last turn carries the three delegations and their results, matched by id.
+    # The supervisor's last turn carries the four delegations and their results, matched by id.
     assistant, reply = mock.requests[-1]["messages"][-2:]
     assert assistant["content"][0]["id"] == reply["content"][0]["tool_use_id"]
 

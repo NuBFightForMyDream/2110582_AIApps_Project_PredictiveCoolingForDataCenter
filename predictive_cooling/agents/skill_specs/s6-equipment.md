@@ -1,5 +1,5 @@
 # S6 — Inspect Equipment Health
-Owner: hardware_engineer. Version: 0.4.0.
+Owner: hardware_engineer. Version: 0.5.0.
 
 Call `read_equipment`: the sensor gateway polls all 22 field devices at the case time over
 BACnet/IP (CRAH units), Modbus TCP (chiller, pumps, cooling tower, room sensors) and SNMP v3

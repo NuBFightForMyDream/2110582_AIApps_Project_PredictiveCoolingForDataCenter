@@ -14,7 +14,7 @@ class Skill:
     name: str
     file: str
     tools: tuple[str, ...]
-    version: str = "0.4.0"
+    version: str = "0.5.0"
 
     def instructions(self) -> str:
         return (Path(__file__).parent / "skill_specs" / self.file).read_text()
@@ -22,18 +22,21 @@ class Skill:
 
 SKILLS = {
     "S1": Skill("S1", "supervisor", "Plan Case", "s1-plan.md",
-                ("call_data_analyst", "call_hardware_engineer", "call_cooling_advisor", "finish_case")),
+                ("call_data_analyst", "call_security_analyst", "call_hardware_engineer", "call_cooling_advisor", "finish_case")),
     "S2": Skill("S2", "data_analyst", "Inspect Sensor Data", "s2-inspect.md", ("read_sensors", "inspect_data_quality")),
     "S3": Skill("S3", "data_analyst", "Analyze & Forecast", "s3-analyze.md", ("summarize_state", "forecast_hold", "finish_analysis")),
     "S4": Skill("S4", "cooling_advisor", "Evaluate Setpoint Plans", "s4-evaluate.md", ("run_mpc", "check_safety", "propose_setpoint")),
     "S5": Skill("S5", "supervisor", "Compose Recommendation", "s5-compose.md", ()),
     "S6": Skill("S6", "hardware_engineer", "Inspect Equipment Health", "s6-equipment.md",
                 ("read_equipment", "diagnose_equipment", "finish_equipment_check")),
+    "S7": Skill("S7", "security_analyst", "Verify Data Integrity", "s7-security.md",
+                ("check_sensor_integrity", "audit_command_channel", "finish_security_review")),
 }
 
 ROLES = {
     "supervisor": "Supervisor (parent)",
     "data_analyst": "Data Analyst (child)",
+    "security_analyst": "Security Analyst (child)",
     "hardware_engineer": "Hardware Engineer (child)",
     "cooling_advisor": "Cooling Advisor (child)",
 }

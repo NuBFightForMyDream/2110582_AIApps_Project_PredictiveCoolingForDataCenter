@@ -3,7 +3,8 @@
     python -m predictive_cooling.pipeline          # about 1-3 minutes
 
 1 sensors -> 2 clean -> 3 train + score forecasters -> tune baselines on validation weeks
--> 4/5 run Fixed, Rule-based and AI + MPC (+ safety) on the plant (6) in four test scenarios.
+-> 4/5 run Fixed, Rule-based and AI + MPC (+ safety) on the plant (6) in four test scenarios
+-> security: train the sensor-integrity model and run two cyber-attack scenarios.
 """
 from concurrent.futures import ProcessPoolExecutor
 import itertools
@@ -20,19 +21,21 @@ from threadpoolctl import threadpool_limits
 from . import config as C
 from . import dataset, forecast, preprocess
 from .controllers import AIController, FixedSetpoint, RuleBased
-from .evaluate import run, scenarios, summarize
+from .evaluate import all_scenarios, run, scenarios, security_scenarios, summarize
+from .hardware import telemetry
 from .mpc import MPC
 from .safety import SafetyFilter
+from .security.integrity import IntegrityModel, IntegrityMonitor
 
-VERSION = 1
+VERSION = 2                      # 2: sensor-integrity model + cyber-attack scenarios
 BUNDLE = C.ARTIFACT_DIR / "bundle.pkl"
-CONTROLLER_ORDER = ["fixed", "rule", "ai", "ai_unsafe"]
+CONTROLLER_ORDER = ["fixed", "rule", "ai", "ai_unsafe", "ai_no_integrity"]
 
 
 def _simulate(job):
     controller, scenario_key, start = job
     with threadpool_limits(1):
-        return run(controller, scenarios()[scenario_key], start=start)
+        return run(controller, all_scenarios()[scenario_key], start=start)
 
 
 def _run_all(jobs, workers):
@@ -110,12 +113,16 @@ def build(workers=None, log=print):
     fixed_sp, fixed_table = tune_fixed(workers)
     rule_params, rule_table = tune_rule(workers)
 
-    log("5/5 Closed-loop tests on the plant: 4 scenarios x 3 controllers (+ AI without safety filter)")
+    log("5/5 Closed-loop tests on the plant: 4 scenarios x 3 controllers (+ AI without safety filter), "
+        "2 cyber attacks x 4 controllers (+ AI without integrity check)")
+    integrity = IntegrityModel.from_data(clean, telemetry.load())
     mpc = MPC(gbm, margins)
     controllers = {"fixed": FixedSetpoint(fixed_sp), "rule": RuleBased(**rule_params),
-                   "ai": AIController(mpc, SafetyFilter(fixed_sp)),
-                   "ai_unsafe": AIController(mpc, SafetyFilter(fixed_sp), use_safety=False)}
-    keys = [(s, c) for s in scenarios() for c in ["fixed", "rule", "ai"]] + [("sensor_failure", "ai_unsafe")]
+                   "ai": AIController(mpc, SafetyFilter(fixed_sp), integrity=IntegrityMonitor(integrity)),
+                   "ai_unsafe": AIController(mpc, SafetyFilter(fixed_sp), use_safety=False),
+                   "ai_no_integrity": AIController(mpc, SafetyFilter(fixed_sp), name="AI + MPC (no integrity check)")}
+    keys = ([(s, c) for s in scenarios() for c in ["fixed", "rule", "ai"]] + [("sensor_failure", "ai_unsafe")]
+            + [(s, c) for s in security_scenarios() for c in ["fixed", "rule", "ai", "ai_no_integrity"]])
     logs = dict(zip(keys, _run_all([(controllers[c], s, C.VAL_END) for s, c in keys], workers)))
     summary = pd.DataFrame([summarize(logs[s, c], controllers[c].name, controllers[c].kind == "ai") | {"scenario": s, "key": c}
                             for s, c in keys])
@@ -123,7 +130,7 @@ def build(workers=None, log=print):
     bundle = dict(
         version=VERSION, sklearn=sklearn.__version__, built_seconds=round(time.time() - started, 1),
         raw=raw, clean=clean, quality=quality, accuracy=accuracy, margins=margins, importance=importance,
-        samples=samples, forecaster=gbm, fixed_sp=fixed_sp, fixed_table=fixed_table, rule_params=rule_params,
+        samples=samples, forecaster=gbm, integrity=integrity, fixed_sp=fixed_sp, fixed_table=fixed_table, rule_params=rule_params,
         rule_table=rule_table, rule_text=RuleBased(**rule_params).describe(), logs=logs, summary=summary,
         controller_names={k: v.name for k, v in controllers.items()},
     )

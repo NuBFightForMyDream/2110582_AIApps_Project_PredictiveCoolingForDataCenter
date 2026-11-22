@@ -2,7 +2,8 @@
 
 * FixedSetpoint  — one constant supply-air setpoint (how many rooms are run today)
 * RuleBased      — react to the hottest inlet: too warm -> colder, comfortably cool -> warmer
-* AIController   — forecaster + MPC (step 3-4) behind the safety filter (step 5)
+* AIController   — forecaster + MPC (step 3-4) behind the safety filter (step 5), with an optional
+                   integrity monitor (forged / replayed readings -> safety rule R6)
 Every controller sees the same sensor readings and returns the next setpoint.
 """
 import math
@@ -85,14 +86,16 @@ class AIController:
     BIAS_SMOOTHING = 0.3          # how fast the feedback correction follows new forecast errors
     BIAS_RANGE = (-0.5, 2.0)      # never trust a correction that would make the room look much cooler
 
-    def __init__(self, mpc: MPC, safety: SafetyFilter, use_safety=True):
-        self.mpc, self.safety, self.use_safety = mpc, safety, use_safety
-        self.name = "AI + MPC" if use_safety else "AI + MPC (no safety filter)"
+    def __init__(self, mpc: MPC, safety: SafetyFilter, use_safety=True, integrity=None, name=None):
+        self.mpc, self.safety, self.use_safety, self.integrity = mpc, safety, use_safety, integrity
+        self.name = name or ("AI + MPC" if use_safety else "AI + MPC (no safety filter)")
         self.initial_sp = 20.0
         self.reset()
 
     def reset(self):
         self.bias, self.expected_next = 0.0, None
+        if self.integrity is not None:
+            self.integrity.reset()
 
     def _learn_from_error(self, state):
         """Feedback: compare last step's forecast with the measured hottest inlet."""
@@ -103,6 +106,7 @@ class AIController:
         self.expected_next = None
 
     def decide(self, prev, reading, current_sp):
+        check = self.integrity.check(reading) if self.integrity is not None else {"trusted": True, "codes": []}
         state = live_state(prev, reading, current_sp)
         self._learn_from_error(state)
         if state.isna().any():                      # a whole sensor group is gone: nothing to plan with
@@ -111,13 +115,16 @@ class AIController:
             proposed, reason, table = self.mpc.decide(state, current_sp, self.bias)
             chosen = table[table["chosen"]].iloc[0]
             self.expected_next = float(chosen["nominal_1"])
-        info = {"proposed": proposed, "reason": reason, "bias": self.bias, "state": state}
+        info = {"proposed": proposed, "reason": reason, "bias": self.bias, "state": state,
+                "integrity": ",".join(check["codes"]), "min_residual_c": check.get("min_residual_c", math.nan)}
         if not self.use_safety:
             final = float(np.clip(proposed, max(C.SP_MIN, current_sp - 1), min(C.SP_MAX, current_sp + 1)))
             return final, info | {"mode": "AI", "rules": ""}
         unfamiliar = self.mpc.forecaster.out_of_range(state) if not state.isna().any() else []
-        final, fired = self.safety.check(proposed, current_sp, reading, unfamiliar)
-        if {"R1_missing_data", "R2_unfamiliar_conditions"} & set(fired):
+        final, fired = self.safety.check(proposed, current_sp, reading, unfamiliar, trusted=check["trusted"])
+        if "R6_untrusted_data" in fired:
+            mode = "Integrity"
+        elif {"R1_missing_data", "R2_unfamiliar_conditions"} & set(fired):
             mode = "Fallback"
         elif "R3_too_hot_now" in fired:
             mode = "Emergency"

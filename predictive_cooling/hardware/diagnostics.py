@@ -17,6 +17,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from ..security.attacks import apply_equipment_attack
 from .gateway import Gateway, SimulatedFieldBus
 from .registry import CRAH_RATED_AIRFLOW_M3H, CRAH_RATED_KW, DEVICES, REGISTRY
 from .telemetry import dew_point, rh_from_dew_point
@@ -107,6 +108,7 @@ class EquipmentWindow:
     at: pd.Timestamp
     days: float = 7.0
     trips: tuple = ()
+    attack: str = "none"                     # demo: "setpoint_tamper" writes CRAH-2's setpoint (security/attacks.py)
     frame: pd.DataFrame = field(init=False)
     snapshot: dict = field(init=False)
 
@@ -115,7 +117,7 @@ class EquipmentWindow:
         frame = self.telemetry.loc[self.at - pd.Timedelta(days=self.days):self.at].copy()     # never after `at`
         for device_id in self.trips:
             frame = trip(frame, device_id, self.at)
-        self.frame = frame
+        self.frame = apply_equipment_attack(frame, self.at, self.attack)
         self.gateway = Gateway(SimulatedFieldBus(frame))
         self.snapshot = self.gateway.poll_all(self.at)
 

@@ -5,6 +5,7 @@ The tools wrap the pipeline steps:
     summarize_state / forecast_hold      -> step 3   (trained forecaster)
     run_mpc / check_safety               -> step 4-5 (81-plan MPC, safety filter)
     read_equipment / diagnose_equipment  -> hardware layer (sensor gateway, equipment historian, diagnostics)
+    check_sensor_integrity / audit_command_channel -> security layer (forged / replayed data, unauthorised writes)
 A CaseWindow / EquipmentWindow holds only readings at or before the case time, so no tool can look into the future.
 """
 from dataclasses import dataclass, field
@@ -22,6 +23,9 @@ from ..hardware.registry import REGISTRY
 from ..mpc import MPC
 from ..preprocess import STUCK_READINGS, VALID_RANGE
 from ..safety import SafetyFilter
+from ..security import commands as security_commands
+from ..security.attacks import apply_room_attack
+from ..security.integrity import IntegrityModel, check_window
 
 REQUIRED = ["supply_air_c", "it_power_kw", "cooling_kw", "outdoor_temp_c"]
 STEP = pd.Timedelta(minutes=C.STEP_MINUTES)
@@ -35,16 +39,21 @@ class AgentContext:
     margins: list
     fallback_sp: float
     equipment: pd.DataFrame | None = None          # data/equipment_telemetry.csv (loaded or built when not given)
+    integrity: IntegrityModel | None = None         # sensor-integrity model (trained on the training weeks if not given)
 
     def __post_init__(self):
         self.mpc = MPC(self.forecaster, self.margins)
         self.safety = SafetyFilter(self.fallback_sp)
         if self.equipment is None:
             self.equipment = telemetry.load()
+        if self.integrity is None:
+            from ..preprocess import clean
+            self.integrity = IntegrityModel.from_data(clean(self.log)[0], self.equipment)
 
     @classmethod
     def from_bundle(cls, bundle, equipment=None):
-        return cls(bundle["raw"], bundle["forecaster"], list(bundle["margins"]), bundle["fixed_sp"], equipment)
+        return cls(bundle["raw"], bundle["forecaster"], list(bundle["margins"]), bundle["fixed_sp"], equipment,
+                   bundle.get("integrity"))
 
 
 def default_context():
@@ -58,6 +67,7 @@ class CaseWindow:
     at: pd.Timestamp
     hours: float
     fault_racks: tuple = ()
+    attack: str = "none"                             # demo: "spoofing" / "replay" forge the room readings
     frame: pd.DataFrame = field(init=False)
     clean: pd.DataFrame | None = field(init=False, default=None)
 
@@ -66,6 +76,7 @@ class CaseWindow:
         start = self.at - pd.Timedelta(hours=self.hours)
         grid = pd.date_range(start, self.at, freq=STEP)
         frame = self.log.loc[start:self.at].reindex(grid).copy()      # at or before `at` only
+        frame = apply_room_attack(frame, self.log, self.at, self.attack)
         frame.loc[self.at, "crah_setpoint_c"] = np.nan                # this decision is not made yet
         for rack in self.fault_racks:                                  # demo: sensors go silent
             frame.loc[self.at - 2 * STEP:self.at, f"inlet_{rack}_c"] = np.nan
@@ -227,6 +238,17 @@ def diagnose_equipment(win: EquipmentWindow):
     return diagnose(win)
 
 
+# ---- S7 security ---------------------------------------------------------------------------
+def check_sensor_integrity(win: CaseWindow, equipment: EquipmentWindow, ctx: AgentContext):
+    """Physics consistency (inlet vs PDU power + supply air) and replay detection over the last day."""
+    return check_window(ctx.integrity, win.frame, equipment.frame, win.at)
+
+
+def audit_command_channel(win: CaseWindow, equipment: EquipmentWindow):
+    """Do the CRAH units run the setpoint the control system commanded?"""
+    return security_commands.audit_commands(win.frame, equipment.frame, win.at)
+
+
 # ---- S4 evaluate ---------------------------------------------------------------------------
 def mpc_decision(win: CaseWindow, ctx: AgentContext):
     state = current_state(win)
@@ -250,11 +272,12 @@ def run_mpc(win: CaseWindow, ctx: AgentContext):
     }
 
 
-def check_safety(win: CaseWindow, ctx: AgentContext, setpoint: float, equipment: str = "none"):
-    """Safety filter on a candidate setpoint; `equipment` is the Hardware Engineer's cooling constraint (rule R5)."""
+def check_safety(win: CaseWindow, ctx: AgentContext, setpoint: float, equipment: str = "none", trusted: bool = True):
+    """Safety filter on a candidate setpoint; `equipment` is the Hardware Engineer's cooling constraint (rule R5),
+    `trusted` the Security Analyst's verdict (rule R6)."""
     state = current_state(win)
     final, fired = ctx.safety.check(float(setpoint), win.setpoint_in_use, _reading(win, win.at),
-                                    ctx.forecaster.out_of_range(state), equipment)
+                                    ctx.forecaster.out_of_range(state), equipment, trusted)
     return {"proposed_c": float(setpoint), "final_c": final, "rules_fired": fired, "changed": final != float(setpoint),
             "equipment_constraint": equipment}
 

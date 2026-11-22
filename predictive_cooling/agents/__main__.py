@@ -6,6 +6,7 @@
     python -m predictive_cooling.agents --at "2026-04-21 00:30" --agent claude
     python -m predictive_cooling.agents --at "2026-04-29 05:30"                  # hardware warnings (no warmer)
     python -m predictive_cooling.agents --at "2026-04-21 00:30" --equipment-fault CRAH-1
+    python -m predictive_cooling.agents --at "2026-04-21 02:00" --attack spoofing        # forged GPU-rack readings
 """
 import argparse
 import json
@@ -21,10 +22,12 @@ def main():
     parser.add_argument("--agent", choices=["offline", "gemini", "claude"], default="offline")
     parser.add_argument("--fault", nargs="*", default=[], help="racks whose sensors fail, e.g. B5 B6")
     parser.add_argument("--equipment-fault", nargs="*", default=[], help="devices that trip, e.g. CRAH-1 CHWP-1")
+    parser.add_argument("--attack", choices=["none", "spoofing", "replay", "setpoint_tamper"], default="none",
+                        help="simulated cyber attack before the case time")
     parser.add_argument("--json", action="store_true", help="print the full result as JSON")
     args = parser.parse_args()
     request = CaseRequest(at=args.at, mode=args.mode, agent_mode=args.agent, sensor_fault=tuple(args.fault),
-                          equipment_fault=tuple(args.equipment_fault),
+                          equipment_fault=tuple(args.equipment_fault), cyber_attack=args.attack,
                           **({"question": args.question} if args.question else {}))
     result = run_case(request)
     if args.json:
