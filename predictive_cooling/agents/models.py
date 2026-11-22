@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .. import config as C
+from ..hardware.registry import TRIPPABLE
 
 
 class StrictModel(BaseModel):
@@ -20,6 +21,8 @@ class CaseRequest(StrictModel):
     agent_mode: Literal["offline", "gemini", "claude"] = "offline"
     sensor_fault: tuple[str, ...] = Field(default=(), description="Demo: these racks' inlet sensors stop reporting "
                                                                    "for the last 45 minutes before `at`.")
+    equipment_fault: tuple[str, ...] = Field(default=(), description="Demo: these cooling devices trip (status 0) "
+                                                                      "for the last 30 minutes before `at`.")
 
     @field_validator("at")
     @classmethod
@@ -35,13 +38,21 @@ class CaseRequest(StrictModel):
             raise ValueError("sensor_fault must list distinct rack ids such as 'B6'")
         return value
 
+    @field_validator("equipment_fault")
+    @classmethod
+    def known_devices(cls, value):
+        if len(set(value)) != len(value) or not set(value) <= set(TRIPPABLE):
+            raise ValueError("equipment_fault must list distinct devices from " + ", ".join(TRIPPABLE))
+        return value
+
 
 class Policy(StrictModel):
-    version: str = "predictive-cooling-v1"
+    version: str = "predictive-cooling-v2"
     inlet_limit_c: float = Field(default=C.INLET_LIMIT, ge=15, le=35)
     history_hours: float = Field(default=2.0, ge=1.5, le=6)
-    tool_budget: int = Field(default=20, ge=0, le=100)
-    model_call_budget: int = Field(default=14, ge=0, le=40)
+    equipment_history_days: float = Field(default=7.0, ge=1, le=14)   # hardware trends need days, not hours
+    tool_budget: int = Field(default=24, ge=0, le=100)
+    model_call_budget: int = Field(default=20, ge=0, le=40)
     deadline_seconds: float = Field(default=120, gt=0, le=600)
 
 

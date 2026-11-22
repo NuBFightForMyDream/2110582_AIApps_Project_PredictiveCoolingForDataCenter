@@ -1,4 +1,7 @@
-"""Agent layer: offline roles, Gemini and Claude parent/child loops (no paid API) and the G1/G2/G3 guards."""
+"""Agent layer: offline roles, Gemini and Claude parent/child loops (no paid API) and the G1/G2/G3 guards.
+
+A full case has four agents: Supervisor -> Data Analyst -> Hardware Engineer -> Cooling Advisor (15 model turns).
+"""
 import json
 
 import pandas as pd
@@ -30,7 +33,7 @@ def actors(result):
 def test_offline_recommend_runs_all_three_agents_and_g3(ctx):
     result = run_case(CaseRequest(at=AT), ctx)
     assert result.status == "completed" and result.decision in ("change", "no_change", "max_cooling")
-    assert {"G1", "supervisor", "data_analyst", "cooling_advisor", "G2", "G3"} <= set(actors(result))
+    assert {"G1", "supervisor", "data_analyst", "hardware_engineer", "cooling_advisor", "G2", "G3"} <= set(actors(result))
     assert {e.skill_id for e in result.events if e.action == "skill_loaded"} == set(SKILLS)
     assert all(c.passed for c in result.checks)
     assert abs(result.recommended_setpoint - result.setpoint_in_use) <= 1
@@ -84,9 +87,12 @@ class ScriptedProvider:
     def __init__(self, ctx, proposal=None):
         self.index = {}
         self.script = {
-            "supervisor": [Call("call_data_analyst"), Call("call_cooling_advisor"), Call("finish_case", {"note": "Done."})],
+            "supervisor": [Call("call_data_analyst"), Call("call_hardware_engineer"), Call("call_cooling_advisor"),
+                           Call("finish_case", {"note": "Done."})],
             "data_analyst": [Call("read_sensors"), Call("inspect_data_quality"), Call("summarize_state"),
                              Call("forecast_hold"), Call("finish_analysis", {"note": "Batch at 01:00 ahead."})],
+            "hardware_engineer": [Call("read_equipment"), Call("diagnose_equipment"),
+                                  Call("finish_equipment_check", {"note": "All equipment OK."})],
             "cooling_advisor": [Call("run_mpc"), Call("check_safety", {"setpoint": 21.0}),
                                 Call("propose_setpoint", {"setpoint": proposal if proposal is not None else 21.0,
                                                           "note": "Pre-cool."})],
@@ -111,8 +117,8 @@ def test_gemini_parent_child_loops_with_scripted_provider(ctx, monkeypatch):
     assert result.status == "completed", result.reason_codes
     assert result.workflow_mode == "gemini_parent_child_tool_calling"
     assert result.recommended_setpoint == expected
-    assert result.model_calls == 11 and result.model_tokens == 110
-    assert set(result.agent_notes) == {"supervisor", "data_analyst", "cooling_advisor"}
+    assert result.model_calls == 15 and result.model_tokens == 150
+    assert set(result.agent_notes) == {"supervisor", "data_analyst", "hardware_engineer", "cooling_advisor"}
 
 
 def test_g3_rejects_a_plausible_but_wrong_model_proposal(ctx, monkeypatch):
@@ -126,6 +132,14 @@ def test_g3_rejects_a_plausible_but_wrong_model_proposal(ctx, monkeypatch):
 def test_model_cannot_skip_the_data_analyst(ctx, monkeypatch):
     provider = ScriptedProvider(ctx)
     provider.script["supervisor"] = [Call("call_cooling_advisor")]
+    install(monkeypatch, provider)
+    result = run_case(CaseRequest(at=AT, agent_mode="gemini"), ctx)
+    assert result.reason_codes == ["TOOL_NOT_ALLOWED"] and result.recommended_setpoint is None
+
+
+def test_model_cannot_skip_the_hardware_engineer(ctx, monkeypatch):
+    provider = ScriptedProvider(ctx)
+    provider.script["supervisor"] = [Call("call_data_analyst"), Call("call_cooling_advisor")]
     install(monkeypatch, provider)
     result = run_case(CaseRequest(at=AT, agent_mode="gemini"), ctx)
     assert result.reason_codes == ["TOOL_NOT_ALLOWED"] and result.recommended_setpoint is None
@@ -152,7 +166,9 @@ class MockClaude:
         self.requests = []
         self.final = final
         self.script = [("call_data_analyst", {}), ("read_sensors", {}), ("inspect_data_quality", {}), ("summarize_state", {}),
-                       ("forecast_hold", {}), ("finish_analysis", {"note": "Batch at 01:00 ahead."}), ("call_cooling_advisor", {}),
+                       ("forecast_hold", {}), ("finish_analysis", {"note": "Batch at 01:00 ahead."}),
+                       ("call_hardware_engineer", {}), ("read_equipment", {}), ("diagnose_equipment", {}),
+                       ("finish_equipment_check", {"note": "All equipment OK."}), ("call_cooling_advisor", {}),
                        ("run_mpc", {}), ("check_safety", {"setpoint": setpoint}), ("propose_setpoint", {"setpoint": setpoint, "note": "Pre-cool."}),
                        ("finish_case", {"note": "Done."})]
 
@@ -184,13 +200,13 @@ def test_claude_runs_a_full_case_on_haiku_through_the_sdk(ctx, monkeypatch):
     assert result.status == "completed", (result.reason_codes, result.events[-1].detail)
     assert result.workflow_mode == "claude_parent_child_tool_calling"
     assert result.recommended_setpoint == expected
-    assert result.model_calls == 11 and result.model_tokens == 110
+    assert result.model_calls == 15 and result.model_tokens == 150
     assert result.execution["resolved_models"] == ["claude-haiku-5-5"]
     for body, (name, _) in zip(mock.requests, mock.script):
         assert body["tool_choice"] == {"type": "any", "disable_parallel_tool_use": True}
         assert name in [tool["name"] for tool in body["tools"]]
         assert "temperature" not in body and "fallbacks" not in body
-    # The supervisor's last turn carries the two delegations and their results, matched by id.
+    # The supervisor's last turn carries the three delegations and their results, matched by id.
     assistant, reply = mock.requests[-1]["messages"][-2:]
     assert assistant["content"][0]["id"] == reply["content"][0]["tool_use_id"]
 

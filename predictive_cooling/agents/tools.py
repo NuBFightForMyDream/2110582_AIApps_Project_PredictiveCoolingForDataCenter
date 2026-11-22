@@ -4,7 +4,8 @@ The tools wrap the pipeline steps:
     read_sensors / inspect_data_quality  -> step 1-2 (sensor log, cleaning rules)
     summarize_state / forecast_hold      -> step 3   (trained forecaster)
     run_mpc / check_safety               -> step 4-5 (81-plan MPC, safety filter)
-A CaseWindow holds only readings at or before the case time, so no tool can look into the future.
+    read_equipment / diagnose_equipment  -> hardware layer (sensor gateway, equipment historian, diagnostics)
+A CaseWindow / EquipmentWindow holds only readings at or before the case time, so no tool can look into the future.
 """
 from dataclasses import dataclass, field
 import math
@@ -15,6 +16,9 @@ import pandas as pd
 from .. import config as C
 from ..controllers import live_state
 from ..forecast import Forecaster
+from ..hardware import telemetry
+from ..hardware.diagnostics import EquipmentWindow, diagnose
+from ..hardware.registry import REGISTRY
 from ..mpc import MPC
 from ..preprocess import STUCK_READINGS, VALID_RANGE
 from ..safety import SafetyFilter
@@ -25,19 +29,22 @@ STEP = pd.Timedelta(minutes=C.STEP_MINUTES)
 
 @dataclass
 class AgentContext:
-    """Everything the tools need: the sensor log and the trained step-3/4/5 components."""
+    """Everything the tools need: the sensor log, the equipment historian and the trained step-3/4/5 components."""
     log: pd.DataFrame
     forecaster: Forecaster
     margins: list
     fallback_sp: float
+    equipment: pd.DataFrame | None = None          # data/equipment_telemetry.csv (loaded or built when not given)
 
     def __post_init__(self):
         self.mpc = MPC(self.forecaster, self.margins)
         self.safety = SafetyFilter(self.fallback_sp)
+        if self.equipment is None:
+            self.equipment = telemetry.load()
 
     @classmethod
-    def from_bundle(cls, bundle):
-        return cls(bundle["raw"], bundle["forecaster"], list(bundle["margins"]), bundle["fixed_sp"])
+    def from_bundle(cls, bundle, equipment=None):
+        return cls(bundle["raw"], bundle["forecaster"], list(bundle["margins"]), bundle["fixed_sp"], equipment)
 
 
 def default_context():
@@ -196,6 +203,30 @@ def forecast_hold(win: CaseWindow, ctx: AgentContext):
     }
 
 
+# ---- S6 inspect equipment -----------------------------------------------------------------
+def read_equipment(win: EquipmentWindow):
+    """Poll every field device through the sensor gateway at the case time."""
+    devices, racks = {}, {}
+    for device_id, reading in win.snapshot.items():
+        device = REGISTRY[device_id]
+        if device.kind == "pdu":
+            racks[device_id[4:]] = reading["values"].get("power_kw")
+            continue
+        devices[device_id] = {"protocol": device.protocol, "comm": reading["comm"],
+                              **{k: v for k, v in reading["values"].items() if v is not None}}
+    bad = [f"{d}.{p}" for d, r in win.snapshot.items() if r["comm"] == "ok" for p, q in r["quality"].items() if q != "good"]
+    return {
+        "case_time": f"{win.at:%Y-%m-%d %H:%M}", "devices_polled": len(win.snapshot),
+        "comm_loss": [d for d, r in win.snapshot.items() if r["comm"] != "ok"], "bad_quality_points": bad,
+        "devices": devices, "rack_power_kw": racks,
+        "rack_power_total_kw": _num(sum(v for v in racks.values() if v is not None), 1),
+    }
+
+
+def diagnose_equipment(win: EquipmentWindow):
+    return diagnose(win)
+
+
 # ---- S4 evaluate ---------------------------------------------------------------------------
 def mpc_decision(win: CaseWindow, ctx: AgentContext):
     state = current_state(win)
@@ -219,21 +250,25 @@ def run_mpc(win: CaseWindow, ctx: AgentContext):
     }
 
 
-def check_safety(win: CaseWindow, ctx: AgentContext, setpoint: float):
+def check_safety(win: CaseWindow, ctx: AgentContext, setpoint: float, equipment: str = "none"):
+    """Safety filter on a candidate setpoint; `equipment` is the Hardware Engineer's cooling constraint (rule R5)."""
     state = current_state(win)
     final, fired = ctx.safety.check(float(setpoint), win.setpoint_in_use, _reading(win, win.at),
-                                    ctx.forecaster.out_of_range(state))
-    return {"proposed_c": float(setpoint), "final_c": final, "rules_fired": fired, "changed": final != float(setpoint)}
+                                    ctx.forecaster.out_of_range(state), equipment)
+    return {"proposed_c": float(setpoint), "final_c": final, "rules_fired": fired, "changed": final != float(setpoint),
+            "equipment_constraint": equipment}
 
 
-def expected_recommendation(win: CaseWindow, ctx: AgentContext):
+def expected_recommendation(win: CaseWindow, ctx: AgentContext, equipment: str = "none"):
     """What the verified tools say should be proposed (used by the offline advisor and by G3)."""
     first, reason, table, _ = mpc_decision(win, ctx)
-    safety = check_safety(win, ctx, first)
+    safety = check_safety(win, ctx, first, equipment)
     return safety["final_c"], reason, table, safety
 
 
-def fallback_step(win: CaseWindow, ctx: AgentContext):
-    """When data is not ready, safety rule R1 moves the room toward the proven fallback setpoint."""
+def fallback_step(win: CaseWindow, ctx: AgentContext, equipment: str = "none"):
+    """When data is not ready, safety rule R1 moves the room toward the proven fallback setpoint
+    (never warmer than now while the Hardware Engineer reports a cooling-path problem, rule R5)."""
     current = win.setpoint_in_use if win.setpoint_in_use is not None else ctx.fallback_sp
-    return float(min(max(ctx.fallback_sp, current - 1), current + 1))
+    target = ctx.fallback_sp if equipment == "none" else min(ctx.fallback_sp, current)
+    return float(min(max(target, current - 1), current + 1))
